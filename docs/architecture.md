@@ -1,122 +1,102 @@
 # Architecture
 
-## One file, no framework
+## Why two modes
 
-The bot is a single bash script. No Python, no Node, no framework. This is
-deliberate: the whole thing has to be droppable onto a fresh Ubuntu VPS
-with nothing but `curl`, `jq`, and `docker` installed, and it has to be
-readable by someone who is not a bash expert at 3 AM when Gemini is
-broken.
+1–3 nodes fit into a single bash script that talks to Telegram directly.
+Beyond that, the operational cost of N independent bots grows faster
+than N: N chats, N tokens, N places to look when something breaks.
 
-The trade-off is that testing requires a little discipline (see
-`tests/`), but the operational surface stays tiny.
+Fleet mode splits the problem. Agents only do local work (probe Google,
+restart WARP, report). The coordinator owns the Telegram bot and the
+state. Adding a node is one CLI call and one systemd unit.
 
-## Long polling, not webhooks
+The two modes do not share code. Bash and Python do not share logic
+without pain, and the logic is small enough that duplication is cheaper
+than the abstraction.
 
-Telegram offers two ways to receive updates: webhooks and long polling.
-
-Webhooks require a public HTTPS endpoint with a valid certificate. That
-is a lot of moving parts for a bot that only talks to one person. Long
-polling only needs outbound HTTPS to `api.telegram.org`, which the
-server already has.
-
-The cost is that `getUpdates` blocks for `POLL_TIMEOUT` seconds. The main
-loop is:
+## Single mode
 
 ```
-while true; do
-  handle_updates        # blocks up to POLL_TIMEOUT seconds
-  scheduled_check       # returns immediately unless CHECK_INTERVAL passed
-done
+Telegram ◄─long-poll─ warp-bot.sh ──socks5──► WARP ──► Google
+                          │
+                          └── docker compose restart
 ```
 
-`scheduled_check` uses a monotonic wall-clock comparison
-(`now - last_check_ts < CHECK_INTERVAL`). It does not use `sleep`,
-because `sleep` would block `getUpdates` and make commands feel laggy.
-Instead, the polling loop itself provides the pacing.
+The script long-polls Telegram, checks Google every `CHECK_INTERVAL`
+seconds through the WARP SOCKS5, and restarts the compose service on RU.
+State lives in `/var/lib/warp-bot`.
 
-## Google country detection
+## Fleet mode
 
-There is no clean, free, unauthenticated Google endpoint that returns the
-country of the caller. Every option is a scrape:
+```
+Telegram ◄─long-poll─ coordinator ──HTTP──► agent@node-N ──► WARP
+                          │                       │
+                          │ SQLite                └── docker compose restart
+                          └─ nodes, commands, results
+```
 
-1. `https://www.google.com` — the HTML contains `xx_YY` language-locale
-   pairs. This is the least reliable source and is used only as a
-   last resort.
-2. `https://play.google.com/` — the page contains
-   `"countryCode":"XX"` in its JavaScript. This is the primary source.
-3. `https://accounts.google.com/` — the login page also contains
-   `"countryCode":"XX"`. This is the fallback if Play is unreachable.
+Agents poll the coordinator. Nothing is pushed to nodes. The
+coordinator keeps:
 
-The probe goes through `--socks5-hostname 127.0.0.1:1080`, so the request
-actually leaves through WARP. If WARP is down, `warp_alive()` returns
-non-zero first and the probe is skipped entirely.
+- `nodes` — name, hashed token, last heartbeat, last known Google country
+- `commands` — queued restarts and their results
+- `meta` — Telegram offset and misc key/values
 
-## Restart, not reconnect
+## Why polling, not push
 
-When RU is detected, the bot runs `docker compose restart <service>`.
+If the coordinator could push commands to agents, it would need an
+inbound channel to every node: SSH, an open HTTP port, or a queue
+system the agents subscribe to. That is more surface area, more
+firewall rules, and one more failure mode per node.
 
-The alternative would be to exec into the container and run
-`warp-cli disconnect && warp-cli connect`. That reconnects the existing
-WARP registration without pulling a fresh one. In practice it often
-reuses the same exit range, which does not clear Google's flag.
+Polling inverts that. Agents initiate every connection. The coordinator
+never has to reach them. A node behind NAT, on a dynamic IP, with no
+open ports, works fine.
 
-A full container restart forces a new registration handshake with
-Cloudflare and usually lands on a different exit IP. That is the whole
-point: a new IP means a clean slate with Google.
+The cost is latency: a queued command is picked up within
+`POLL_INTERVAL` seconds (default 5). For a manual restart that is
+imperceptible.
 
-The downside is that the SOCKS5 port is briefly unavailable while the
-container restarts. On a node that only serves AI tools, that is
-acceptable. If your node also serves live traffic, schedule the check
-during low-traffic windows or set `COMPOSE_SERVICE` to a dedicated
-AI-only WARP instance.
+## Why SQLite
 
-## Cooldown
+30 agents writing one row per minute is 30 writes per minute. SQLite
+handles that trivially, and the file is easy to back up (`cp`) and
+inspect (`sqlite3`).
 
-`RESTART_COOLDOWN` defaults to 300 seconds, the same as
-`CHECK_INTERVAL`. Without it, a detection of RU would trigger a restart,
-the next check five minutes later could still see RU (Google caches
-geo-location for a while), and the bot would restart again — an endless
-loop of pointless restarts.
+If you outgrow SQLite — say, hundreds of nodes — swap it for Postgres.
+The schema is small and the queries are simple.
 
-With the cooldown, the bot restarts at most once per window. If the
-first restart does not help, the next attempt happens after the cooldown,
-giving WARP time to settle.
+## Why the agent re-probes Google locally
 
-`/restart` from Telegram also respects the cooldown. If you need to
-force a restart during the cooldown, wait it out or temporarily set
-`RESTART_COOLDOWN=0` and restart the service.
+The coordinator does not need to know whether Google is reachable — it
+has no WARP. Each agent probes Google through its own WARP SOCKS5 and
+reports the country in the heartbeat. The coordinator just stores and
+displays.
 
-## Multi-node
+That means two nodes on different continents may report different
+countries, and that is correct: their WARP exit IPs differ.
 
-The bot is designed to run on several servers. Each node needs its own
-bot token, because Telegram does not fan out updates to multiple
-long-polling clients. All nodes can share the same `TG_CHAT_ID`, so
-every notification lands in one chat.
+## Why the coordinator does not store tokens in cleartext
 
-`NODE_NAME` is prepended to every outgoing message as
-`[<code>name</code>]`. That makes a chat with ten nodes readable.
+Well, it does — SQLite stores the token as issued. Rotating the token
+is a matter of `add-node <name>` again. If you want hashed tokens,
+hash on receipt and compare with `secrets.compare_digest` after
+hashing the presented one. The current design trades that hardening
+for simplicity; the tokens never leave the private network.
 
-The state directory (`/var/lib/warp-bot`) is per-node. It holds the last
-restart timestamp and the Telegram update offset. Do not share it between
-nodes.
+## Sandboxing
 
-## systemd sandboxing
-
-The unit runs the script with:
+Both systemd units run with:
 
 - `NoNewPrivileges=true`
 - `ProtectSystem=full`
 - `ProtectHome=true`
 - `PrivateTmp=true`
 
-The script needs to write only to `/var/lib/warp-bot` and to talk to
-Docker. `ProtectSystem=full` makes everything outside `/var` read-only,
-which is enough for `docker compose restart`. `PrivateTmp` gives the
-service its own `/tmp`, so any temporary file it creates cannot collide
-with the host or with other services.
+The coordinator writes only to `/var/lib/warp-coordinator`. The agent
+writes only to `/var/lib/warp-agent` and invokes `docker compose`.
 
-If you later switch to `docker exec warp warp-cli ...` and find that the
-sandbox blocks it, add `ProtectSystem=strict` with an explicit
-`ReadWritePaths=` for the docker socket directory. The current setup
+If you later switch the agent to `docker exec warp warp-cli ...` and
+find the sandbox blocks it, add `ProtectSystem=strict` with
+`ReadWritePaths=` for the docker socket directory. The current design
 does not need that.

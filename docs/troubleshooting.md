@@ -2,24 +2,19 @@
 
 ## Google reports RU even though the node is in Germany
 
-This is the problem the project was built to work around.
+Cloudflare WARP exit IPs are shared. Heavy Gemini use on a single IP gets
+it flagged, and Google starts geo-locating it as Russian. Cloudflare has
+also acknowledged some WARP ranges are mis-geolocated by Google, IPv6 in
+particular.
 
-Cloudflare WARP exit IPs are shared. When many users on the same WARP
-exit IP hammer Gemini, Google eventually flags the IP and starts
-geo-locating it as Russian. Independently of that, Cloudflare itself has
-acknowledged that some WARP address ranges are mis-geolocated by Google —
-IPv6 addresses in particular are often reported as RU or IR.
-
-So you end up with a split brain:
+Symptoms:
 
 - `https://cloudflare.com/cdn-cgi/trace` says `loc=DE`
 - `https://api.country.is` says `DE`
-- `https://get.geojs.io/v1/ip/country.json` says `DE`
 - Google says `RU`
 
-That is not a bug in this bot. It is Google's view of the WARP range.
-Restarting the WARP container pulls a fresh IP from Cloudflare's pool and
-usually clears it — which is exactly what the bot does.
+That is expected. A WARP container restart pulls a fresh IP and usually
+clears it.
 
 ### Confirm the split brain
 
@@ -38,16 +33,10 @@ curl -sSL --max-time 15 --socks5-hostname 127.0.0.1:1080 \
   | grep -oP '"countryCode":"\K[A-Z]{2}' | head -1
 ```
 
-If the first two agree on a European country and Google says `RU`, the
-bot is behaving correctly: it will restart WARP.
+### If Google still says RU after restart
 
-### If Google still says RU after a restart
-
-The new IP landed in another flagged range. Options:
-
-1. **Wait.** The bot will try again after the cooldown.
-
-2. **Force a new registration.** Inside the WARP container:
+1. Wait. The bot will retry after the cooldown.
+2. Force a fresh WARP registration:
 
    ```bash
    docker exec warp warp-cli registration delete
@@ -55,8 +44,8 @@ The new IP landed in another flagged range. Options:
    docker exec warp warp-cli connect
    ```
 
-3. **Switch WARP to IPv4 only.** IPv4 WARP ranges are generally
-   geo-located more accurately by Google. In `docker-compose.yml` set:
+3. Disable IPv6 in WARP. IPv4 ranges are geo-located more accurately
+   by Google:
 
    ```yaml
    sysctls:
@@ -64,14 +53,11 @@ The new IP landed in another flagged range. Options:
      - net.ipv4.conf.all.src_valid_mark=1
    ```
 
-   then `docker compose up -d`.
+   Then `docker compose up -d`.
 
-## Could not detect Google country through WARP
+## Could not detect Google country
 
-Google returned something the parser did not understand — usually a
-consent redirect or an empty body.
-
-Test manually:
+Google returned a consent redirect or an empty body.
 
 ```bash
 curl -sSL --max-time 15 --socks5-hostname 127.0.0.1:1080 \
@@ -80,17 +66,11 @@ curl -sSL --max-time 15 --socks5-hostname 127.0.0.1:1080 \
   'https://play.google.com/'
 ```
 
-- `HTTP 302` with `redirect https://play.google.com/store` is normal.
-  `-L` follows it.
-- `HTTP 302` with `consent.google.com` means Google wants a consent
-  cookie. The bot does not send one. If this becomes frequent, open an
-  issue — adding a `SOCS` cookie is the fix.
-- `HTTP 302` with `google.com/sorry/index` means Google served a captcha.
-  Nothing the bot can do; it will retry after the interval.
+- `HTTP 302` → `play.google.com/store` is normal, `-L` follows it.
+- `HTTP 302` → `consent.google.com` means a consent cookie is required.
+- `HTTP 302` → `google.com/sorry/index` means a captcha.
 
 ## WARP SOCKS5 is unreachable
-
-The WARP container is not answering on `127.0.0.1:1080`.
 
 ```bash
 docker ps --filter name=warp
@@ -98,41 +78,40 @@ ss -tlnp | grep 1080
 docker logs --tail 50 warp
 ```
 
-If the container is up but the port is not listening, check the compose
-file: the port mapping must be `127.0.0.1:1080:1080` (or `1080:1080`).
+Port mapping must be `127.0.0.1:1080:1080`.
 
-## The bot does not reply at all
+## Fleet: node shows ⚫ stale
 
-1. Check the service is running:
+The agent cannot reach the coordinator.
 
-   ```bash
-   sudo systemctl status warp-bot
-   sudo journalctl -u warp-bot -n 50 --no-pager
-   ```
+```bash
+sudo systemctl status warp-agent
+sudo journalctl -u warp-agent -n 50 --no-pager
+curl -v http://<coordinator>:8080/commands \
+  -H "X-Node: <name>" -H "X-Token: <token>"
+```
 
-2. If the log says `FATAL: TG_TOKEN is not configured`, the env file was
-   not picked up. Verify:
+Common causes: wrong `COORDINATOR_URL`, wrong `NODE_TOKEN`, firewall
+blocking 8080, coordinator down.
 
-   ```bash
-   sudo systemctl show warp-bot --property=Environment
-   ```
+## Fleet: `add-node` prints a token but the agent gets 401
 
-   You should see `TG_TOKEN=...`, `TG_CHAT_ID=...`, `NODE_NAME=...`.
+The token is shown once. If it was lost, re-run `add-node` with the
+same name — it rotates the token — and update the agent.
 
-3. If the service is up but the bot is silent, make sure you sent
-   `/start` to the bot from the account whose numeric id is in
-   `TG_CHAT_ID`. Telegram does not allow a bot to message a user who has
-   never initiated a conversation.
+## Single mode: bot does not reply
 
-## Another user messages the bot
+```bash
+sudo systemctl status warp-bot
+sudo journalctl -u warp-bot -n 50 --no-pager
+```
 
-Every incoming update is checked against `TG_CHAT_ID`. Messages from any
-other user are discarded before any command handler runs. The bot does
-not reply to them, does not log them, and does not acknowledge them. This
-is by design.
+If you see `FATAL: TG_TOKEN is not configured`, the env file was not
+picked up:
 
-## Two nodes, one bot token
+```bash
+sudo systemctl show warp-bot --property=Environment
+```
 
-Do not do that. Telegram delivers each update to exactly one long-polling
-client. Two processes on two servers with the same token will split
-updates unpredictably. Create a separate bot for each node.
+Also make sure you sent `/start` to the bot from the account whose id is
+in `TG_CHAT_ID`.

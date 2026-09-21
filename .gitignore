@@ -4,3 +4,7 @@
 .DS_Store
 /tmp/
 tests/tmp/
+single/tests/tmp/
+fleet/tests/tmp/
+__pycache__/
+*.pyc

@@ -1,16 +1,32 @@
 name: ci
 on: [push, pull_request]
+
 jobs:
-  lint:
+  single:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: shellcheck
-        run: shellcheck bin/warp-bot.sh scripts/*.sh tests/**/*.sh
-      - name: shfmt
         run: |
-          curl -sSL https://github.com/mvdan/sh/releases/latest/download/shfmt_linux_amd64 -o /usr/local/bin/shfmt
-          chmod +x /usr/local/bin/shfmt
-          shfmt -d -i 2 -ci -sr bin/ scripts/ tests/
-      - name: tests
-        run: tests/run.sh
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck single/bin/*.sh single/scripts/*.sh \
+                     single/tests/run.sh single/tests/cases/*.sh
+      - name: single tests
+        run: make -C single test
+
+  fleet:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: py_compile
+        run: |
+          python3 -m py_compile fleet/coordinator/coordinator.py
+          python3 -m py_compile fleet/agent/agent.py
+      - name: fleet tests
+        run: |
+          chmod +x fleet/tests/run.sh
+          fleet/tests/run.sh

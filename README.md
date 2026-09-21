@@ -1,73 +1,89 @@
 # warp-healthcheck
 
-Telegram bot and healthcheck that restarts a WARP container when Google
-starts reporting the exit node as RU.
+Keep WARP exit nodes from being geo-located as RU by Google.
 
-## Why
+Two modes, one repository:
 
-This project exists because of Gemini. When many users share a single
-foreign VPN exit IP and hammer Gemini, Google eventually flags that IP
-and starts geo-locating it as Russian. Once that happens, Gemini is
-effectively unusable from that node.
+- **single** — one bash script with a Telegram bot, one node.
+  Dependencies: `curl`, `jq`, `docker`. No Python.
+- **fleet** — Python coordinator + agent, one Telegram bot for any
+  number of nodes. Agents poll the coordinator, no inbound access to
+  nodes is required.
 
-Putting WARP in front of the AI tools helps — until Gemini flags the WARP
-exit IP too and starts reporting RU again. Restarting the WARP container
-gives you a fresh exit IP from Cloudflare's pool, and Gemini works again.
+## Which mode to pick
 
-Doing that by hand is annoying. This bot watches the Google-reported
-country through WARP and restarts the container automatically when it
-flips to RU. It also gives you a Telegram interface to check status and
-trigger a restart manually.
+| Nodes | Mode   |
+|-------|--------|
+| 1–3   | single |
+| 4+    | fleet  |
 
-## Features
+Single mode is a self-contained script: it long-polls Telegram itself,
+probes Google through the local WARP SOCKS5, and restarts the WARP
+container on RU. Everything runs on the node.
 
-- Long-polling Telegram bot, only one authorized user is answered.
-- Every `CHECK_INTERVAL` seconds, asks Google (through the WARP SOCKS5
-  proxy) which country it thinks the exit node is in.
-- If that country is `RU`, restarts the WARP docker-compose service.
-- Restart cooldown to avoid hammering WARP.
-- Every Telegram message is prefixed with `NODE_NAME`, so you can run
-  the bot on several nodes and tell them apart in one chat.
-- systemd-ready, sandboxed unit.
+Fleet mode splits the same logic into two roles. Agents on each node do
+the probing and restarting. A central coordinator holds the Telegram
+bot, keeps state in SQLite, and routes commands. Nodes only need
+outbound HTTP to the coordinator — nothing inbound.
 
-## Requirements
+## Why this exists
 
-- Ubuntu 24.04 (or any systemd-based distro).
-- `curl`, `jq`, `docker` with the Compose plugin.
-- A running WARP container from
-  [cmj2002/warp-docker](https://github.com/cmj2002/warp-docker)
-  exposing SOCKS5 on `127.0.0.1:1080`.
+Gemini flags shared exit IPs as Russian after heavy use. Once that
+happens, Gemini is unusable from that node. WARP in front of the AI
+tools helps until Google flags the WARP exit range too. A WARP
+container restart pulls a fresh IP from Cloudflare and clears the flag.
 
-## Install
+This project does that check-and-restart automatically.
+
+## Quickstart — single
 
 ```bash
-git clone https://github.com/fwlhh/healthcheck
-cd healthcheck
-sudo make install
-```
-
-Then edit `/etc/warp-bot.env` and set `TG_TOKEN`, `TG_CHAT_ID`,
-`NODE_NAME`. See [docs/install.md](docs/install.md) for the full
-walkthrough, including how to create a bot and get your chat id.
-
-Start the service:
-
-```bash
+git clone https://github.com/fwlhh/warp-healthcheck
+cd warp-healthcheck
+sudo make install-single
+sudo nano /etc/warp-bot.env          # TG_TOKEN, TG_CHAT_ID, NODE_NAME
 sudo systemctl enable --now warp-bot
 sudo journalctl -u warp-bot -f
 ```
 
-## Commands
+## Quickstart — fleet
 
-- `/status`  — current Google country via WARP
-- `/check`   — run a check right now
-- `/restart` — restart WARP manually
-- `/help`    — this message
+On the coordinator host (one server):
+
+```bash
+sudo make install-coordinator
+sudo nano /etc/warp-coordinator.env  # TG_TOKEN, TG_CHAT_ID
+sudo systemctl enable --now warp-coordinator
+sudo warp-coordinator add-node NODE_GE01   # save the printed token
+```
+
+On every node (repeat for each):
+
+```bash
+git clone https://github.com/you/warp-healthcheck
+cd warp-healthcheck
+sudo make install-agent
+sudo nano /etc/warp-agent.env        # URL, NODE_NAME, NODE_TOKEN
+sudo systemctl enable --now warp-agent
+```
+
+In Telegram: `/nodes`, `/status NODE_GE01`, `/restart NODE_GE01`.
+
+## Requirements
+
+- Ubuntu 24.04 or another systemd distro.
+- `curl`, `jq`, `docker` with the Compose plugin.
+- Python 3.10+ (fleet mode only; Ubuntu 24.04 ships 3.12).
+- WARP container from
+  [cmj2002/warp-docker](https://github.com/cmj2002/warp-docker)
+  exposing SOCKS5 on `127.0.0.1:1080`.
 
 ## Docs
 
-- [Install](docs/install.md)
+- [Single mode](docs/single.md)
+- [Fleet mode](docs/fleet.md)
 - [Configuration](docs/configuration.md)
+- [Telegram commands](docs/commands.md)
 - [Troubleshooting](docs/troubleshooting.md)
 - [Architecture](docs/architecture.md)
 
