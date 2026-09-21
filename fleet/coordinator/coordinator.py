@@ -92,42 +92,83 @@ def db_connect():
     return conn
 
 
+def _table_columns(conn, table):
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {r["name"] for r in rows}
+
+
+def _migrate_commands(conn):
+    """Add columns introduced after the initial schema."""
+    cols = _table_columns(conn, "commands")
+    additions = [
+        ("delivered_at", "INTEGER"),
+        ("attempts",     "INTEGER NOT NULL DEFAULT 0"),
+        ("ok",           "INTEGER"),
+        ("output",       "TEXT"),
+        ("result_at",    "INTEGER"),
+    ]
+    for name, typ in additions:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE commands ADD COLUMN {name} {typ}")
+            log("INFO", f"migration: added commands.{name}")
+
+
+def _migrate_nodes(conn):
+    cols = _table_columns(conn, "nodes")
+    additions = [
+        ("last_heartbeat", "INTEGER NOT NULL DEFAULT 0"),
+        ("google_country", "TEXT"),
+        ("warp_alive",     "INTEGER NOT NULL DEFAULT 0"),
+        ("last_restart",   "INTEGER NOT NULL DEFAULT 0"),
+    ]
+    for name, typ in additions:
+        if name not in cols:
+            conn.execute(f"ALTER TABLE nodes ADD COLUMN {name} {typ}")
+            log("INFO", f"migration: added nodes.{name}")
+
+
 def db_init():
     d = os.path.dirname(DB_PATH)
     if d:
         os.makedirs(d, exist_ok=True)
     conn = db_connect()
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS nodes (
-            name           TEXT PRIMARY KEY,
-            token          TEXT NOT NULL,
-            registered_at  INTEGER NOT NULL,
-            last_heartbeat INTEGER NOT NULL DEFAULT 0,
-            google_country TEXT,
-            warp_alive     INTEGER NOT NULL DEFAULT 0,
-            last_restart   INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS commands (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            node         TEXT NOT NULL,
-            command      TEXT NOT NULL,
-            created_at   INTEGER NOT NULL,
-            delivered_at INTEGER,
-            attempts     INTEGER NOT NULL DEFAULT 0,
-            ok           INTEGER,
-            output       TEXT,
-            result_at    INTEGER
-        );
-        CREATE INDEX IF NOT EXISTS idx_commands_pending
-            ON commands(node, result_at, delivered_at);
-        CREATE TABLE IF NOT EXISTS meta (
-            key   TEXT PRIMARY KEY,
-            value TEXT
-        );
-        """
-    )
-    conn.close()
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS nodes (
+                name           TEXT PRIMARY KEY,
+                token          TEXT NOT NULL,
+                registered_at  INTEGER NOT NULL,
+                last_heartbeat INTEGER NOT NULL DEFAULT 0,
+                google_country TEXT,
+                warp_alive     INTEGER NOT NULL DEFAULT 0,
+                last_restart   INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS commands (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                node         TEXT NOT NULL,
+                command      TEXT NOT NULL,
+                created_at   INTEGER NOT NULL,
+                delivered_at INTEGER,
+                attempts     INTEGER NOT NULL DEFAULT 0,
+                ok           INTEGER,
+                output       TEXT,
+                result_at    INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_commands_pending
+                ON commands(node, result_at, delivered_at);
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
+            """
+        )
+        _migrate_nodes(conn)
+        _migrate_commands(conn)
+        # Backfill: старые записи без attempts
+        conn.execute("UPDATE commands SET attempts = 0 WHERE attempts IS NULL")
+    finally:
+        conn.close()
 
 
 def meta_get(key, default=""):
