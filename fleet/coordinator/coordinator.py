@@ -14,6 +14,10 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
 def env(key: str, default: str | None = None, required: bool = False) -> str:
     val = os.environ.get(key, default)
     if required and not val:
@@ -22,12 +26,14 @@ def env(key: str, default: str | None = None, required: bool = False) -> str:
     return val or ""
 
 
+# Non-secret settings, safe to read at import time.
 HTTP_HOST     = env("HTTP_HOST", "0.0.0.0")
 HTTP_PORT     = int(env("HTTP_PORT", "8080"))
 DB_PATH       = env("DB_PATH", "/var/lib/warp-coordinator/coordinator.db")
 STALE_AFTER   = int(env("STALE_AFTER", "180"))
 TG_OFFSET_KEY = "tg_offset"
 
+# Secrets, loaded lazily so CLI subcommands do not require them.
 TG_TOKEN: str = ""
 TG_CHAT_ID: int = 0
 
@@ -35,12 +41,17 @@ TG_CHAT_ID: int = 0
 def load_telegram_config() -> None:
     global TG_TOKEN, TG_CHAT_ID
     TG_TOKEN = env("TG_TOKEN", required=True)
+    raw = env("TG_CHAT_ID", required=True)
     try:
-        TG_CHAT_ID = int(env("TG_CHAT_ID", required=True))
+        TG_CHAT_ID = int(raw)
     except ValueError:
-        print("FATAL: TG_CHAT_ID must be an integer", file=sys.stderr)
+        print(f"FATAL: TG_CHAT_ID must be an integer, got {raw!r}", file=sys.stderr)
         sys.exit(1)
 
+
+# ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
 
 def now() -> int:
     return int(time.time())
@@ -105,6 +116,10 @@ def set_meta(key: str, value: str) -> None:
     conn.close()
 
 
+# ---------------------------------------------------------------------------
+# Telegram API
+# ---------------------------------------------------------------------------
+
 def tg_api(method: str, **params):
     url = f"https://api.telegram.org/bot{TG_TOKEN}/{method}"
     data = urllib.parse.urlencode(params).encode()
@@ -112,8 +127,14 @@ def tg_api(method: str, **params):
     try:
         with urllib.request.urlopen(req, timeout=40) as resp:
             return json.load(resp)
+    except urllib.error.HTTPError as e:
+        # 409 on getUpdates is expected when another poller holds the token.
+        # Do not spam the log; bot_loop applies backoff.
+        if not (method == "getUpdates" and e.code == 409):
+            print(f"tg_api {method} http {e.code}", flush=True)
+        return None
     except Exception as e:
-        print(f"tg_api {method} failed: {e}", flush=True)
+        print(f"tg_api {method} failed: {type(e).__name__}: {e}", flush=True)
         return None
 
 
@@ -136,6 +157,42 @@ def fmt_duration(seconds: int) -> str:
         return f"{seconds // 3600}h"
     return f"{seconds // 86400}d"
 
+
+# ---------------------------------------------------------------------------
+# Telegram sanity check (startup only)
+# ---------------------------------------------------------------------------
+
+def sanity_check_telegram() -> None:
+    """Warn on startup if the token is bad, a webhook is set, or the bot
+    is unreachable."""
+    me = tg_api("getMe")
+    if me and me.get("ok"):
+        username = (me.get("result") or {}).get("username", "?")
+        print(f"telegram bot @{username}", flush=True)
+    else:
+        print(
+            "WARNING: cannot reach Telegram — check TG_TOKEN and network",
+            flush=True,
+        )
+
+    info = tg_api("getWebhookInfo")
+    if info and info.get("ok"):
+        url = (info.get("result") or {}).get("url") or ""
+        if url:
+            print(
+                f"WARNING: webhook is set to {url!r}; getUpdates will fail with 409",
+                flush=True,
+            )
+            print(
+                "         run: "
+                f"curl 'https://api.telegram.org/bot$TG_TOKEN/deleteWebhook?drop_pending_updates=true'",
+                flush=True,
+            )
+
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
 
 HELP_TEXT = (
     "<b>warp-coordinator</b>\n\n"
@@ -231,6 +288,15 @@ def queue_restart_all() -> None:
 
 def show_logs(name: str) -> None:
     conn = db_connect()
+
+    node = conn.execute(
+        "SELECT name FROM nodes WHERE name = ?", (name,)
+    ).fetchone()
+    if not node:
+        conn.close()
+        tg_send(f"Unknown node: <code>{name}</code>")
+        return
+
     r = conn.execute(
         "SELECT id, command, result FROM commands "
         "WHERE node = ? AND result IS NOT NULL "
@@ -238,18 +304,27 @@ def show_logs(name: str) -> None:
         (name,),
     ).fetchone()
     conn.close()
+
     if not r:
-        tg_send(f"No results for <code>{name}</code>")
+        tg_send(
+            f"Node <code>{name}</code> has no command history yet. "
+            f"Try <code>/restart {name}</code>."
+        )
         return
+
     try:
         payload = json.loads(r["result"])
         ok = payload.get("ok")
         out = payload.get("output", "")
     except Exception:
         ok, out = False, str(r["result"])
+
     icon = "✅" if ok else "❌"
     safe = out.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-    tg_send(f"{icon} <b>{name}</b> cmd#{r['id']} ({r['command']})\n<pre>{safe[:3000]}</pre>")
+    tg_send(
+        f"{icon} <b>{name}</b> cmd#{r['id']} ({r['command']})\n"
+        f"<pre>{safe[:3000]}</pre>"
+    )
 
 
 def handle_command(text: str) -> None:
@@ -285,33 +360,65 @@ def handle_command(text: str) -> None:
         tg_send(f"Unknown command: <code>{cmd}</code>\n\n{HELP_TEXT}")
 
 
+# ---------------------------------------------------------------------------
+# Bot loop
+# ---------------------------------------------------------------------------
+
 def bot_loop() -> None:
     offset = int(get_meta(TG_OFFSET_KEY) or "0")
+    print(f"bot_loop started, offset={offset}", flush=True)
+
+    backoff = 5
+    backoff_max = 300
+
     while True:
-        resp = tg_api(
-            "getUpdates",
-            offset=offset,
-            timeout=25,
-            allowed_updates='["message"]',
-        )
-        if not resp or not resp.get("ok"):
-            time.sleep(5)
+        try:
+            resp = tg_api(
+                "getUpdates",
+                offset=offset,
+                timeout=25,
+                allowed_updates='["message"]',
+            )
+        except Exception as e:
+            print(
+                f"bot_loop getUpdates crashed: {type(e).__name__}: {e}",
+                flush=True,
+            )
+            time.sleep(backoff)
+            backoff = min(backoff * 2, backoff_max)
             continue
+
+        if not resp or not resp.get("ok"):
+            print(f"bot_loop backoff {backoff}s", flush=True)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, backoff_max)
+            continue
+
+        backoff = 5
+
         for upd in resp.get("result", []):
             offset = upd["update_id"] + 1
-            set_meta(TG_OFFSET_KEY, str(offset))
-            msg = upd.get("message") or {}
-            sender = (msg.get("from") or {}).get("id")
-            if sender != TG_CHAT_ID:
-                continue
-            text = msg.get("text", "")
-            if not text:
-                continue
             try:
+                set_meta(TG_OFFSET_KEY, str(offset))
+                msg = upd.get("message") or {}
+                sender = (msg.get("from") or {}).get("id")
+                if sender != TG_CHAT_ID:
+                    continue
+                text = msg.get("text", "")
+                if not text:
+                    continue
                 handle_command(text)
             except Exception as e:
-                print(f"handle_command error: {e}", flush=True)
+                print(
+                    f"bot_loop: failed to handle update "
+                    f"{upd.get('update_id')}: {type(e).__name__}: {e}",
+                    flush=True,
+                )
 
+
+# ---------------------------------------------------------------------------
+# HTTP API
+# ---------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "warp-coordinator/1.0"
@@ -342,7 +449,9 @@ class Handler(BaseHTTPRequestHandler):
         if not name or not token:
             return None
         conn = db_connect()
-        r = conn.execute("SELECT token FROM nodes WHERE name = ?", (name,)).fetchone()
+        r = conn.execute(
+            "SELECT token FROM nodes WHERE name = ?", (name,)
+        ).fetchone()
         conn.close()
         if not r or not secrets.compare_digest(r["token"], token):
             return None
@@ -435,13 +544,17 @@ class Handler(BaseHTTPRequestHandler):
         output = str(body.get("output", ""))[:4000]
         conn = db_connect()
         conn.execute(
-            "UPDATE commands SET result = ?, result_at = ? WHERE id = ? AND node = ?",
+            "UPDATE commands SET result = ?, result_at = ? "
+            "WHERE id = ? AND node = ?",
             (json.dumps({"ok": ok, "output": output}), now(), cmd_id, name),
         )
         conn.close()
         icon = "✅" if ok else "❌"
         safe = output.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        tg_send(f"{icon} <code>{name}</code> cmd#{cmd_id} finished\n<pre>{safe[:1500]}</pre>")
+        tg_send(
+            f"{icon} <code>{name}</code> cmd#{cmd_id} finished\n"
+            f"<pre>{safe[:1500]}</pre>"
+        )
         self.reply(200, {"ok": True})
 
     def route_notify(self) -> None:
@@ -455,6 +568,10 @@ class Handler(BaseHTTPRequestHandler):
             tg_send(f"[<code>{name}</code>] {text}")
         self.reply(200, {"ok": True})
 
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def cli_add_node(name: str) -> None:
     token = secrets.token_urlsafe(32)
@@ -480,7 +597,8 @@ def cli_remove_node(name: str) -> None:
 def cli_list_nodes() -> None:
     conn = db_connect()
     rows = conn.execute(
-        "SELECT name, last_heartbeat, google_country, warp_alive FROM nodes ORDER BY name"
+        "SELECT name, last_heartbeat, google_country, warp_alive "
+        "FROM nodes ORDER BY name"
     ).fetchall()
     conn.close()
     if not rows:
@@ -497,10 +615,17 @@ def cli_list_nodes() -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+
 def run_server() -> None:
     load_telegram_config()
     db_init()
+    sanity_check_telegram()
+
     threading.Thread(target=bot_loop, daemon=True).start()
+
     server = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), Handler)
     server.daemon_threads = True
     print(f"listening on {HTTP_HOST}:{HTTP_PORT}", flush=True)
@@ -516,6 +641,7 @@ def main() -> int:
         print("  coordinator.py remove-node <name>")
         print("  coordinator.py list-nodes")
         return 1
+
     cmd = sys.argv[1]
     if cmd == "run":
         run_server()
