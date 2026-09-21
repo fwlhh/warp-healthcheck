@@ -13,6 +13,7 @@ Design notes:
 
 import contextlib
 import json
+import logging
 import os
 import secrets
 import signal
@@ -66,14 +67,21 @@ def load_tg_config():
 # Logging
 # ===========================================================================
 
-_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+
+LOG = logging.getLogger("warp-coordinator")
 
 
-def log(level, msg):
-    if _LEVELS.get(level, 0) < _LEVELS.get(LOG_LEVEL, 20):
-        return
-    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    print(f"{ts} {level:5s} {msg}", flush=True)
+def setup_logging(level: str = "INFO") -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)-5s %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
+    )
+
+
+def log(level: str, msg: str) -> None:
+    """Kept for compatibility; prefer LOG.info/warning/error directly."""
+    LOG.log(getattr(logging, level.upper(), logging.INFO), msg)
 
 
 # ===========================================================================
@@ -861,6 +869,7 @@ def sanity_check():
 
 
 def run_server():
+    setup_logging(LOG_LEVEL)
     load_tg_config()
     db_init()
     sanity_check()

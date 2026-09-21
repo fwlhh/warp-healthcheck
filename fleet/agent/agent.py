@@ -11,6 +11,7 @@ Design notes:
 
 import contextlib
 import json
+import logging
 import os
 import re
 import subprocess
@@ -69,14 +70,20 @@ GOOGLE_CONSENT_COOKIE = (
 # Logging
 # ===========================================================================
 
-_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+
+LOG = logging.getLogger("warp-agent")
 
 
-def log(level, msg):
-    if _LEVELS.get(level, 0) < _LEVELS.get(LOG_LEVEL, 20):
-        return
-    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    print(f"{ts} {level:5s} {msg}", flush=True)
+def setup_logging(level: str = "INFO") -> None:
+    logging.basicConfig(
+        level=getattr(logging, level.upper(), logging.INFO),
+        format="%(asctime)s %(levelname)-5s %(name)s: %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%SZ",
+    )
+
+
+def log(level: str, msg: str) -> None:
+    LOG.log(getattr(logging, level.upper(), logging.INFO), msg)
 
 
 # ===========================================================================
@@ -390,6 +397,7 @@ def handle_command(c):
 
 
 def main():
+    setup_logging(LOG_LEVEL)
     log("INFO", f"agent started node={NODE_NAME} coordinator={COORDINATOR_URL}")
 
     last_check = 0
