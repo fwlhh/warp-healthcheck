@@ -1,0 +1,24 @@
+[Unit]
+Description=Telegram WARP bot and healthcheck
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/warp-bot.sh
+Restart=always
+RestartSec=5
+
+EnvironmentFile=/etc/warp-bot.env
+
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=warp-bot
+
+[Install]
+WantedBy=multi-user.target
