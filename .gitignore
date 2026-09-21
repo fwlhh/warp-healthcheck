@@ -7,4 +7,12 @@ tests/tmp/
 single/tests/tmp/
 fleet/tests/tmp/
 __pycache__/
+.venv/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.egg-info/
+dist/
+build/
