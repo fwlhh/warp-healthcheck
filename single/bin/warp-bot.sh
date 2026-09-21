@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# warp-bot.sh — Telegram bot and healthcheck for a WARP container.
+# warp-bot.sh — Telegram bot and healthcheck for a WARP container (single mode).
 #
 # Behaviour:
 #   * Long-polls Telegram for commands.
@@ -9,8 +9,8 @@
 #   * Every CHECK_INTERVAL seconds, asks Google (through the WARP SOCKS5
 #     proxy) which country it thinks we are in.
 #   * If that country is RU, restarts the WARP docker-compose service.
-#   * Every outgoing message is prefixed with NODE_NAME so multiple
-#     nodes are distinguishable in a shared chat.
+#   * After any restart (auto or manual) probes Google again and reports
+#     the new country and WARP exit IP to Telegram.
 #
 # Requires: curl, jq, docker.
 
@@ -22,9 +22,6 @@ set -euo pipefail
 
 readonly TG_TOKEN="${TG_TOKEN:-PASTE_BOT_TOKEN_HERE}"
 readonly TG_CHAT_ID="${TG_CHAT_ID:-0}"
-
-# Human-readable name of this node. Shown in every Telegram message.
-# Allowed: letters, digits, dot, underscore, dash.
 readonly NODE_NAME="${NODE_NAME:-unknown-node}"
 
 readonly WARP_PROXY="${WARP_PROXY:-127.0.0.1:1080}"
@@ -36,12 +33,14 @@ readonly CHECK_INTERVAL="${CHECK_INTERVAL:-300}"
 readonly RESTART_COOLDOWN="${RESTART_COOLDOWN:-300}"
 readonly POLL_TIMEOUT="${POLL_TIMEOUT:-25}"
 readonly CURL_TIMEOUT="${CURL_TIMEOUT:-10}"
+readonly WARP_BOOT_TIMEOUT="${WARP_BOOT_TIMEOUT:-45}"
 
 readonly STATE_DIR="${STATE_DIR:-/var/lib/warp-bot}"
 readonly STATE_FILE="${STATE_DIR}/last-restart"
 readonly OFFSET_FILE="${STATE_DIR}/offset"
 
 readonly USER_AGENT='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36'
+readonly GOOGLE_CONSENT_COOKIE='SOCS=CAISNQgDEitib3FfaWRlbnRpdHlmcm9udGVuZHVpc2VydmVyXzIwMjUwNzMwLjA1X3AwGgJlbiACGgYIgPC_xAY'
 
 readonly EXIT_OK=0
 readonly EXIT_FAIL=1
@@ -123,30 +122,104 @@ tg_send() {
 # WARP helpers
 # ---------------------------------------------------------------------------
 
+# Returns 0 if the WARP SOCKS5 proxy answers, non-zero otherwise.
 warp_alive() {
   curl -fs --max-time 8 \
     --socks5-hostname "${WARP_PROXY}" \
     'https://cloudflare.com/cdn-cgi/trace' >/dev/null 2>&1
 }
 
+# Prints the WARP exit IP as reported by Cloudflare, or nothing.
+warp_exit_ip() {
+  local trace
+  trace=$(curl -s --max-time 8 \
+    --socks5-hostname "${WARP_PROXY}" \
+    'https://cloudflare.com/cdn-cgi/trace' 2>/dev/null || true)
+  grep -oP '^ip=\K.*' <<<"${trace}" | head -n1 || true
+}
+
+# Prints the WARP exit country as reported by Cloudflare, or nothing.
+warp_exit_country() {
+  local trace
+  trace=$(curl -s --max-time 8 \
+    --socks5-hostname "${WARP_PROXY}" \
+    'https://cloudflare.com/cdn-cgi/trace' 2>/dev/null || true)
+  grep -oP '^loc=\K[A-Z]{2}' <<<"${trace}" | head -n1 || true
+}
+
+# Prints the ISO country code Google reports through WARP, or nothing.
+# Primary source: YouTube (countryCode in inline JS).
+# Fallbacks: Google Search (gl param), accounts.google.com.
 detect_google_country() {
   local opts=(
-    -fsL
+    -fsSL
     --max-time "${CURL_TIMEOUT}"
     -A "${USER_AGENT}"
+    -H "Cookie: ${GOOGLE_CONSENT_COOKIE}"
+    -H 'Accept-Language: en-US,en;q=0.9'
     --socks5-hostname "${WARP_PROXY}"
   )
   local resp country=''
 
-  resp=$(curl "${opts[@]}" 'https://www.google.com' 2>/dev/null || true)
-  country=$(sed -n 's/.*"[a-z]\{2\}_\([A-Z]\{2\}\)".*/\1/p' <<<"${resp}" | head -n1)
-
-  if [[ -z "${country}" ]]; then
-    resp=$(curl "${opts[@]}" 'https://play.google.com/' 2>/dev/null || true)
-    country=$(grep -oP 'countryCode":"\K[A-Z]{2}' <<<"${resp}" | head -n1 || true)
+  resp=$(curl "${opts[@]}" 'https://www.youtube.com' 2>/dev/null || true)
+  country=$(grep -oP '"countryCode":"\K[A-Z]{2}' <<<"${resp}" | head -n1 || true)
+  if [[ -n "${country}" ]]; then
+    printf '%s' "${country}"
+    return
   fi
 
+  resp=$(curl "${opts[@]}" 'https://www.google.com/search?q=test' 2>/dev/null || true)
+  country=$(grep -oP '"gl":"\K[A-Z]{2}' <<<"${resp}" | head -n1 || true)
+  if [[ -n "${country}" ]]; then
+    printf '%s' "${country}"
+    return
+  fi
+
+  resp=$(curl "${opts[@]}" 'https://accounts.google.com/' 2>/dev/null || true)
+  country=$(grep -oP '"countryCode":"\K[A-Z]{2}' <<<"${resp}" | head -n1 || true)
   printf '%s' "${country}"
+}
+
+# Blocks until warp_alive() returns 0 or WARP_BOOT_TIMEOUT seconds elapse.
+# Returns 0 if WARP came up, non-zero otherwise.
+wait_for_warp() {
+  local waited=0
+  while (( waited < WARP_BOOT_TIMEOUT )); do
+    if warp_alive; then
+      return 0
+    fi
+    sleep 3
+    waited=$(( waited + 3 ))
+  done
+  return 1
+}
+
+# Composes a short post-restart report: new Google country + WARP exit IP.
+# Prints a Telegram-formatted string (no leading newline).
+post_restart_report() {
+  local country ip cloudflare_country
+
+  if ! wait_for_warp; then
+    printf '⚠️ WARP did not come up within %ss' "${WARP_BOOT_TIMEOUT}"
+    return
+  fi
+
+  ip=$(warp_exit_ip)
+  cloudflare_country=$(warp_exit_country)
+  country=$(detect_google_country)
+
+  local out=''
+  out+="Google now: <b>${country:-?}</b>"
+  if [[ -n "${cloudflare_country}" ]]; then
+    out+=$'\n'"Cloudflare loc: <code>${cloudflare_country}</code>"
+  fi
+  if [[ -n "${ip}" ]]; then
+    out+=$'\n'"Exit IP: <code>${ip}</code>"
+  fi
+  if [[ "${country}" == 'RU' ]]; then
+    out+=$'\n'"🔴 still RU — try /restart again after cooldown"
+  fi
+  printf '%s' "${out}"
 }
 
 # ---------------------------------------------------------------------------
@@ -162,6 +235,12 @@ read_last_restart() {
   printf '%s' "${value}"
 }
 
+# Restarts the WARP service and reports the new geo state.
+#   $1  human-readable reason shown in the Telegram notification
+# Returns:
+#   EXIT_OK        on success
+#   EXIT_FAIL      on docker failure
+#   EXIT_COOLDOWN  if called again within RESTART_COOLDOWN seconds
 restart_warp() {
   local reason="$1"
   local now last elapsed
@@ -184,9 +263,15 @@ restart_warp() {
   local output
   if output=$("${cmd[@]}" 2>&1); then
     printf '%s\n' "${now}" >"${STATE_FILE}"
+
+    local report
+    report=$(post_restart_report)
+
     tg_send "✅ WARP restarted
 Reason: <b>${reason}</b>
-Service: <code>${COMPOSE_SERVICE:-all}</code>"
+Service: <code>${COMPOSE_SERVICE:-all}</code>
+
+${report}"
     log 'restart ok'
     return "${EXIT_OK}"
   fi
@@ -247,9 +332,9 @@ scheduled_check() {
 cmd_help() {
   tg_send "🤖 <b>WARP bot</b>
 
-/status  — current Google country via WARP
+/status  — current Google country and exit IP
 /check   — run a check right now
-/restart — restart WARP manually
+/restart — restart WARP manually and report the new state
 /help    — this message"
 }
 
@@ -259,14 +344,19 @@ cmd_status() {
     return 0
   fi
 
-  local country
+  local country ip cloudflare_country
   country=$(detect_google_country)
-  if [[ -z "${country}" ]]; then
-    tg_send '⚠️ Could not detect Google country'
-    return 0
-  fi
+  ip=$(warp_exit_ip)
+  cloudflare_country=$(warp_exit_country)
 
-  tg_send "🌍 Google via WARP: <b>${country}</b>"
+  local out="🌍 Google via WARP: <b>${country:-?}</b>"
+  if [[ -n "${cloudflare_country}" ]]; then
+    out+=$'\n'"Cloudflare loc: <code>${cloudflare_country}</code>"
+  fi
+  if [[ -n "${ip}" ]]; then
+    out+=$'\n'"Exit IP: <code>${ip}</code>"
+  fi
+  tg_send "${out}"
 }
 
 cmd_check() {
@@ -282,14 +372,16 @@ cmd_check() {
     return 0
   fi
 
-  tg_send "🌍 Google via WARP: <b>${country}</b>"
+  if [[ "${country}" != 'RU' ]]; then
+    cmd_status
+    return 0
+  fi
 
-  if [[ "${country}" == 'RU' ]]; then
-    rc=0
-    restart_warp 'manual /check: Google=RU' || rc=$?
-    if (( rc == EXIT_COOLDOWN )); then
-      tg_send '⏳ Restart skipped: cooldown active.'
-    fi
+  tg_send '🇷🇺 Google is detected as <b>RU</b> via WARP → restarting'
+  rc=0
+  restart_warp 'manual /check: Google=RU' || rc=$?
+  if (( rc == EXIT_COOLDOWN )); then
+    tg_send '⏳ Restart skipped: cooldown active.'
   fi
 }
 

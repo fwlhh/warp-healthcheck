@@ -35,6 +35,10 @@ container restart pulls a fresh IP from Cloudflare and clears the flag.
 
 This project does that check-and-restart automatically.
 
+**After every restart** — automatic or manual — the bot probes Google
+again and reports the new country and the fresh WARP exit IP to
+Telegram. You see immediately whether the restart helped.
+
 ## Quickstart — single
 
 ```bash
@@ -48,38 +52,54 @@ sudo journalctl -u warp-bot -f
 
 ## Quickstart — fleet
 
-On the coordinator host (one server):
+On the coordinator host (one server, control plane only — no Docker, no
+WARP):
 
 ```bash
 sudo make install-coordinator
 sudo nano /etc/warp-coordinator.env  # TG_TOKEN, TG_CHAT_ID
 sudo systemctl enable --now warp-coordinator
-sudo warp-coordinator add-node NODE_GE01   # save the printed token
+sudo warp-coordinator add-node classic-copper   # save the printed token
 ```
 
-On every node (repeat for each):
+On every WARP node (repeat for each):
 
 ```bash
-git clone https://github.com/you/warp-healthcheck
+git clone https://github.com/fwlhh/warp-healthcheck
 cd warp-healthcheck
 sudo make install-agent
 sudo nano /etc/warp-agent.env        # URL, NODE_NAME, NODE_TOKEN
 sudo systemctl enable --now warp-agent
 ```
 
-In Telegram: `/nodes`, `/status NODE_GE01`, `/restart NODE_GE01`.
+In Telegram: `/nodes`, `/status classic-copper`, `/restart classic-copper`.
 
 ## Requirements
 
 - Ubuntu 24.04 or another systemd distro.
-- `curl`, `jq`, `docker` with the Compose plugin.
-- Python 3.10+ (fleet mode only; Ubuntu 24.04 ships 3.12).
+- `curl`, `jq`, `docker` with the Compose plugin (nodes only).
+- Python 3.10+ (fleet mode coordinator; Ubuntu 24.04 ships 3.12).
 - WARP container from
   [cmj2002/warp-docker](https://github.com/cmj2002/warp-docker)
   exposing SOCKS5 on `127.0.0.1:1080`.
 
+## How Google is detected
+
+`play.google.com` used to include `"countryCode"` in its HTML, but our
+checks no longer find it there. The bot now uses **YouTube**
+(`www.youtube.com`) with the `SOCS` consent cookie, which still exposes
+`"countryCode":"XX"` in inline JavaScript. Fallbacks, tried in order:
+
+1. `https://www.youtube.com` — primary, returns `"countryCode":"XX"`.
+2. `https://www.google.com/search?q=test` — returns `"gl":"XX"`.
+3. `https://accounts.google.com/` — returns `"countryCode":"XX"`.
+
+All three requests go through the WARP SOCKS5 proxy, so they reflect
+what the WARP exit node sees, not what the host sees.
+
 ## Docs
 
+- [Install](docs/install.md)
 - [Single mode](docs/single.md)
 - [Fleet mode](docs/fleet.md)
 - [Configuration](docs/configuration.md)
