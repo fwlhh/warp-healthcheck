@@ -22,13 +22,24 @@ def env(key: str, default: str | None = None, required: bool = False) -> str:
     return val or ""
 
 
-TG_TOKEN      = env("TG_TOKEN", required=True)
-TG_CHAT_ID    = int(env("TG_CHAT_ID", required=True))
 HTTP_HOST     = env("HTTP_HOST", "0.0.0.0")
 HTTP_PORT     = int(env("HTTP_PORT", "8080"))
 DB_PATH       = env("DB_PATH", "/var/lib/warp-coordinator/coordinator.db")
 STALE_AFTER   = int(env("STALE_AFTER", "180"))
 TG_OFFSET_KEY = "tg_offset"
+
+TG_TOKEN: str = ""
+TG_CHAT_ID: int = 0
+
+
+def load_telegram_config() -> None:
+    global TG_TOKEN, TG_CHAT_ID
+    TG_TOKEN = env("TG_TOKEN", required=True)
+    try:
+        TG_CHAT_ID = int(env("TG_CHAT_ID", required=True))
+    except ValueError:
+        print("FATAL: TG_CHAT_ID must be an integer", file=sys.stderr)
+        sys.exit(1)
 
 
 def now() -> int:
@@ -487,6 +498,7 @@ def cli_list_nodes() -> None:
 
 
 def run_server() -> None:
+    load_telegram_config()
     db_init()
     threading.Thread(target=bot_loop, daemon=True).start()
     server = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), Handler)
