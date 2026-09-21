@@ -19,6 +19,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 # ===========================================================================
 # Config
@@ -51,9 +52,9 @@ HTTP_TIMEOUT = int(env("HTTP_TIMEOUT", "20"))
 WARP_BOOT_TIMEOUT = int(env("WARP_BOOT_TIMEOUT", "60"))
 LOG_LEVEL = env("LOG_LEVEL", "INFO").upper()
 
-STATE_DIR = env("STATE_DIR", "/var/lib/warp-agent")
-STATE_FILE = os.path.join(STATE_DIR, "state.json")
-PENDING_DIR = os.path.join(STATE_DIR, "pending")
+STATE_DIR: Path = Path(env("STATE_DIR", "/var/lib/warp-agent"))
+STATE_FILE: Path = STATE_DIR / "state.json"
+PENDING_DIR: Path = STATE_DIR / "pending"
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -91,23 +92,21 @@ def log(level: str, msg: str) -> None:
 # ===========================================================================
 
 
-def _load_state():
+def _load_state() -> dict:
     try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
+        return json.loads(STATE_FILE.read_text())
     except Exception:
         return {"last_restart": 0}
 
 
-def _save_state(s):
+def _save_state(s: dict) -> None:
     try:
-        os.makedirs(STATE_DIR, exist_ok=True)
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(s, f)
-        os.replace(tmp, STATE_FILE)
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = STATE_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(s))
+        tmp.replace(STATE_FILE)
     except Exception as e:
-        log("ERROR", f"state save: {e}")
+        LOG.error(f"state save: {e}")
 
 
 def get_last_restart():
@@ -125,28 +124,26 @@ def set_last_restart(ts):
 # ===========================================================================
 
 
-def _pending_path(cid):
-    return os.path.join(PENDING_DIR, f"{cid}.json")
+def _pending_path(cid: int) -> Path:
+    return PENDING_DIR / f"{cid}.json"
 
 
 def queue_result(cid, ok, output):
     try:
-        os.makedirs(PENDING_DIR, exist_ok=True)
-        tmp = _pending_path(cid) + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(
-                {"id": cid, "ok": ok, "output": output, "queued_at": int(time.time())},
-                f,
-            )
-        os.replace(tmp, _pending_path(cid))
-        log("WARN", f"queued result cmd#{cid} for later delivery")
+        PENDING_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = _pending_path(cid).with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({
+            "id": cid, "ok": ok, "output": output,
+            "queued_at": int(time.time()),
+        }))
+        tmp.replace(_pending_path(cid))
     except Exception as e:
-        log("ERROR", f"queue_result: {e}")
+        LOG.error(f"queue_result: {e}")
 
 
-def _pending_files():
+def _pending_files() -> list[Path]:
     try:
-        return sorted(os.listdir(PENDING_DIR))
+        return sorted(PENDING_DIR.iterdir())
     except FileNotFoundError:
         return []
 
@@ -164,14 +161,14 @@ def flush_pending():
         except Exception as e:
             log("ERROR", f"pending read {fn}: {e}")
             with contextlib.suppress(Exception):
-                os.remove(path)
+                path.unlink()
             continue
 
         ok, _ = http_post("/result", payload)
         if ok:
             log("INFO", f"flushed pending result cmd#{payload.get('id')}")
             with contextlib.suppress(Exception):
-                os.remove(path)
+                path.unlink()
 
 
 # ===========================================================================
@@ -311,7 +308,7 @@ def compose_restart():
         "docker",
         "compose",
         "-f",
-        os.path.join(COMPOSE_DIR, COMPOSE_FILE),
+        str(Path(COMPOSE_DIR) / COMPOSE_FILE),
         "restart",
     ]
     if COMPOSE_SERVICE:

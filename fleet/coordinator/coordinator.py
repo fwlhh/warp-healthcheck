@@ -25,6 +25,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 # ===========================================================================
 # Config
@@ -41,7 +42,7 @@ def env(key, default=None, required=False):
 
 HTTP_HOST = env("HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(env("HTTP_PORT", "8080"))
-DB_PATH = env("DB_PATH", "/var/lib/warp-coordinator/coordinator.db")
+DB_PATH = Path(env("DB_PATH", "/var/lib/warp-coordinator/coordinator.db"))
 STALE_AFTER = int(env("STALE_AFTER", "180"))
 COMMAND_LEASE = int(env("COMMAND_LEASE", "120"))
 COMMAND_MAX_ATTEMPTS = int(env("COMMAND_MAX_ATTEMPTS", "3"))
@@ -93,8 +94,8 @@ def now() -> int:
     return int(time.time())
 
 
-def db_connect():
-    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+def db_connect() -> sqlite3.Connection:
+    conn = sqlite3.connect(str(DB_PATH), timeout=30, isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -137,45 +138,13 @@ def _migrate_nodes(conn):
             log("INFO", f"migration: added nodes.{name}")
 
 
-def db_init():
-    d = os.path.dirname(DB_PATH)
-    if d:
-        os.makedirs(d, exist_ok=True)
+def db_init() -> None:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = db_connect()
     try:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS nodes (
-                name           TEXT PRIMARY KEY,
-                token          TEXT NOT NULL,
-                registered_at  INTEGER NOT NULL,
-                last_heartbeat INTEGER NOT NULL DEFAULT 0,
-                google_country TEXT,
-                warp_alive     INTEGER NOT NULL DEFAULT 0,
-                last_restart   INTEGER NOT NULL DEFAULT 0
-            );
-            CREATE TABLE IF NOT EXISTS commands (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                node         TEXT NOT NULL,
-                command      TEXT NOT NULL,
-                created_at   INTEGER NOT NULL,
-                delivered_at INTEGER,
-                attempts     INTEGER NOT NULL DEFAULT 0,
-                ok           INTEGER,
-                output       TEXT,
-                result_at    INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_commands_pending
-                ON commands(node, result_at, delivered_at);
-            CREATE TABLE IF NOT EXISTS meta (
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            );
-            """
-        )
+        conn.executescript(...)
         _migrate_nodes(conn)
         _migrate_commands(conn)
-        # Backfill: старые записи без attempts
         conn.execute("UPDATE commands SET attempts = 0 WHERE attempts IS NULL")
     finally:
         conn.close()
