@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""warp-agent — heartbeat + command executor for one WARP node."""
+"""warp-agent — heartbeat + command executor for one WARP node.
+
+Design notes:
+  * Every HTTP call to the coordinator has a timeout and is retried on
+    the next loop iteration.
+  * Results that fail to POST are queued to disk and re-sent later.
+  * Every subprocess call has a timeout.
+  * Every state transition is logged.
+"""
 
 import json
 import os
@@ -11,7 +19,11 @@ import urllib.error
 import urllib.request
 
 
-def env(key: str, default: str | None = None, required: bool = False) -> str:
+# ===========================================================================
+# Config
+# ===========================================================================
+
+def env(key, default=None, required=False):
     val = os.environ.get(key, default)
     if required and not val:
         print(f"FATAL: {key} is not set", file=sys.stderr)
@@ -19,24 +31,27 @@ def env(key: str, default: str | None = None, required: bool = False) -> str:
     return val or ""
 
 
-COORDINATOR_URL = env("COORDINATOR_URL", required=True).rstrip("/")
-NODE_NAME       = env("NODE_NAME", required=True)
-NODE_TOKEN      = env("NODE_TOKEN", required=True)
+COORDINATOR_URL    = env("COORDINATOR_URL", required=True).rstrip("/")
+NODE_NAME          = env("NODE_NAME", required=True)
+NODE_TOKEN         = env("NODE_TOKEN", required=True)
 
-WARP_PROXY      = env("WARP_PROXY", "127.0.0.1:1080")
-COMPOSE_DIR     = env("COMPOSE_DIR", "/opt/warp")
-COMPOSE_FILE    = env("COMPOSE_FILE", "docker-compose.yml")
-COMPOSE_SERVICE = env("COMPOSE_SERVICE", "warp")
+WARP_PROXY         = env("WARP_PROXY", "127.0.0.1:1080")
+COMPOSE_DIR        = env("COMPOSE_DIR", "/opt/warp")
+COMPOSE_FILE       = env("COMPOSE_FILE", "docker-compose.yml")
+COMPOSE_SERVICE    = env("COMPOSE_SERVICE", "warp")
 
 HEARTBEAT_INTERVAL = int(env("HEARTBEAT_INTERVAL", "60"))
 POLL_INTERVAL      = int(env("POLL_INTERVAL", "5"))
 CHECK_INTERVAL     = int(env("CHECK_INTERVAL", "300"))
 RESTART_COOLDOWN   = int(env("RESTART_COOLDOWN", "300"))
-CURL_TIMEOUT       = int(env("CURL_TIMEOUT", "10"))
-WARP_BOOT_TIMEOUT  = int(env("WARP_BOOT_TIMEOUT", "45"))
+CURL_TIMEOUT       = int(env("CURL_TIMEOUT", "30"))
+HTTP_TIMEOUT       = int(env("HTTP_TIMEOUT", "20"))
+WARP_BOOT_TIMEOUT  = int(env("WARP_BOOT_TIMEOUT", "60"))
+LOG_LEVEL          = env("LOG_LEVEL", "INFO").upper()
 
-STATE_DIR  = env("STATE_DIR", "/var/lib/warp-agent")
-STATE_FILE = os.path.join(STATE_DIR, "last_restart")
+STATE_DIR   = env("STATE_DIR", "/var/lib/warp-agent")
+STATE_FILE  = os.path.join(STATE_DIR, "state.json")
+PENDING_DIR = os.path.join(STATE_DIR, "pending")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -49,157 +64,113 @@ GOOGLE_CONSENT_COOKIE = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Local state
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Logging
+# ===========================================================================
 
-def read_last_restart() -> int:
+_LEVELS = {"DEBUG": 10, "INFO": 20, "WARN": 30, "ERROR": 40}
+
+
+def log(level, msg):
+    if _LEVELS.get(level, 0) < _LEVELS.get(LOG_LEVEL, 20):
+        return
+    ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    print(f"{ts} {level:5s} {msg}", flush=True)
+
+
+# ===========================================================================
+# State
+# ===========================================================================
+
+def _load_state():
     try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return int(f.read().strip() or "0")
+        with open(STATE_FILE) as f:
+            return json.load(f)
     except Exception:
-        return 0
+        return {"last_restart": 0}
 
 
-def write_last_restart(ts: int) -> None:
+def _save_state(s):
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            f.write(str(ts))
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(s, f)
+        os.replace(tmp, STATE_FILE)
     except Exception as e:
-        print(f"state write failed: {e}", flush=True)
+        log("ERROR", f"state save: {e}")
 
 
-# ---------------------------------------------------------------------------
-# WARP helpers
-# ---------------------------------------------------------------------------
+def get_last_restart():
+    return int(_load_state().get("last_restart", 0) or 0)
 
-def curl(opts: list, url: str, timeout: int | None = None) -> str:
-    cmd = ["curl", *opts, url]
+
+def set_last_restart(ts):
+    s = _load_state()
+    s["last_restart"] = int(ts)
+    _save_state(s)
+
+
+# ===========================================================================
+# Pending results queue
+# ===========================================================================
+
+def _pending_path(cid):
+    return os.path.join(PENDING_DIR, f"{cid}.json")
+
+
+def queue_result(cid, ok, output):
     try:
-        r = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=(timeout or CURL_TIMEOUT + 10),
-        )
-        return r.stdout
-    except Exception:
-        return ""
-
-
-def warp_alive() -> bool:
-    out = curl(
-        ["-fs", "--max-time", "8", "--socks5-hostname", WARP_PROXY],
-        "https://cloudflare.com/cdn-cgi/trace",
-    )
-    return bool(out.strip())
-
-
-def warp_exit_ip() -> str:
-    trace = curl(
-        ["-s", "--max-time", "8", "--socks5-hostname", WARP_PROXY],
-        "https://cloudflare.com/cdn-cgi/trace",
-    )
-    m = re.search(r"^ip=(\S+)", trace, re.MULTILINE)
-    return m.group(1) if m else ""
-
-
-def warp_exit_country() -> str:
-    trace = curl(
-        ["-s", "--max-time", "8", "--socks5-hostname", WARP_PROXY],
-        "https://cloudflare.com/cdn-cgi/trace",
-    )
-    m = re.search(r"^loc=([A-Z]{2})", trace, re.MULTILINE)
-    return m.group(1) if m else ""
-
-
-def _curl_google(url: str) -> str:
-    return curl(
-        [
-            "-fsSL",
-            "--max-time", str(CURL_TIMEOUT),
-            "-A", USER_AGENT,
-            "-H", f"Cookie: {GOOGLE_CONSENT_COOKIE}",
-            "-H", "Accept-Language: en-US,en;q=0.9",
-            "--socks5-hostname", WARP_PROXY,
-        ],
-        url,
-    )
-
-
-def detect_google_country() -> str:
-    # 1) YouTube
-    resp = _curl_google("https://www.youtube.com")
-    m = re.search(r'"countryCode":"([A-Z]{2})"', resp)
-    if m:
-        return m.group(1)
-
-    # 2) Google Search
-    resp = _curl_google("https://www.google.com/search?q=test")
-    m = re.search(r'"gl":"([A-Z]{2})"', resp)
-    if m:
-        return m.group(1)
-
-    # 3) accounts.google.com
-    resp = _curl_google("https://accounts.google.com/")
-    m = re.search(r'"countryCode":"([A-Z]{2})"', resp)
-    if m:
-        return m.group(1)
-
-    return ""
-
-
-def wait_for_warp() -> bool:
-    waited = 0
-    while waited < WARP_BOOT_TIMEOUT:
-        if warp_alive():
-            return True
-        time.sleep(3)
-        waited += 3
-    return False
-
-
-def post_restart_report() -> str:
-    """Returns a short human-readable report after a restart."""
-    if not wait_for_warp():
-        return f"⚠️ WARP did not come up within {WARP_BOOT_TIMEOUT}s"
-
-    country = detect_google_country()
-    cloudflare_country = warp_exit_country()
-    ip = warp_exit_ip()
-
-    lines = [f"Google now: {country or '?'}"]
-    if cloudflare_country:
-        lines.append(f"Cloudflare loc: {cloudflare_country}")
-    if ip:
-        lines.append(f"Exit IP: {ip}")
-    if country == "RU":
-        lines.append("🔴 still RU — try /restart again after cooldown")
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# Restart
-# ---------------------------------------------------------------------------
-
-def do_restart() -> tuple[bool, str]:
-    cmd = ["docker", "compose", "-f", os.path.join(COMPOSE_DIR, COMPOSE_FILE), "restart"]
-    if COMPOSE_SERVICE:
-        cmd.append(COMPOSE_SERVICE)
-    print(f"running: {' '.join(cmd)}", flush=True)
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        return r.returncode == 0, (r.stdout + r.stderr).strip()
+        os.makedirs(PENDING_DIR, exist_ok=True)
+        tmp = _pending_path(cid) + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"id": cid, "ok": ok, "output": output,
+                       "queued_at": int(time.time())}, f)
+        os.replace(tmp, _pending_path(cid))
+        log("WARN", f"queued result cmd#{cid} for later delivery")
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        log("ERROR", f"queue_result: {e}")
 
 
-# ---------------------------------------------------------------------------
-# Coordinator HTTP
-# ---------------------------------------------------------------------------
+def _pending_files():
+    try:
+        return sorted(os.listdir(PENDING_DIR))
+    except FileNotFoundError:
+        return []
 
-def _headers() -> dict:
+
+def flush_pending():
+    """Try to deliver queued results. Called before polling commands."""
+    files = _pending_files()
+    if not files:
+        return
+    for fn in files:
+        path = os.path.join(PENDING_DIR, fn)
+        try:
+            with open(path) as f:
+                payload = json.load(f)
+        except Exception as e:
+            log("ERROR", f"pending read {fn}: {e}")
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+            continue
+
+        ok, _ = http_post("/result", payload)
+        if ok:
+            log("INFO", f"flushed pending result cmd#{payload.get('id')}")
+            try:
+                os.remove(path)
+            except Exception:
+                pass
+
+
+# ===========================================================================
+# HTTP client
+# ===========================================================================
+
+def _headers():
     return {
         "X-Node": NODE_NAME,
         "X-Token": NODE_TOKEN,
@@ -207,141 +178,257 @@ def _headers() -> dict:
     }
 
 
-def _log_http_error(verb: str, path: str, e: urllib.error.HTTPError) -> None:
-    if e.code == 401:
-        print(
-            f"{verb} {path}: 401 unauthorized — "
-            f"check NODE_NAME/NODE_TOKEN against coordinator",
-            flush=True,
+def _http(method, path, body=None):
+    url = f"{COORDINATOR_URL}{path}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=_headers(), method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+            return True, json.load(resp)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            log("ERROR", f"{method} {path}: 401 unauthorized "
+                         f"(check NODE_NAME/NODE_TOKEN)")
+        else:
+            log("WARN", f"{method} {path}: HTTP {e.code}")
+        return False, None
+    except Exception as e:
+        log("WARN", f"{method} {path}: {type(e).__name__}: {e}")
+        return False, None
+
+
+def http_post(path, body):
+    return _http("POST", path, body)
+
+
+def http_get(path):
+    return _http("GET", path)
+
+
+# ===========================================================================
+# WARP probes
+# ===========================================================================
+
+def _curl(opts, url):
+    try:
+        r = subprocess.run(
+            ["curl", *opts, url],
+            capture_output=True, text=True, timeout=CURL_TIMEOUT + 15,
         )
-    else:
-        print(f"{verb} {path} http {e.code}", flush=True)
+        return r.stdout
+    except subprocess.TimeoutExpired:
+        log("WARN", f"curl timeout for {url}")
+        return ""
+    except Exception as e:
+        log("WARN", f"curl failed: {e}")
+        return ""
 
 
-def coordinator_post(path: str, body: dict) -> dict | None:
-    req = urllib.request.Request(
-        f"{COORDINATOR_URL}{path}",
-        data=json.dumps(body).encode(),
-        headers=_headers(),
-        method="POST",
+def warp_alive():
+    out = _curl(
+        ["-fs", "--max-time", "8", "--socks5-hostname", WARP_PROXY],
+        "https://cloudflare.com/cdn-cgi/trace",
     )
+    return bool(out.strip())
+
+
+def warp_trace():
+    return _curl(
+        ["-s", "--max-time", "8", "--socks5-hostname", WARP_PROXY],
+        "https://cloudflare.com/cdn-cgi/trace",
+    )
+
+
+def warp_exit_ip():
+    m = re.search(r"^ip=(\S+)", warp_trace(), re.MULTILINE)
+    return m.group(1) if m else ""
+
+
+def warp_exit_country():
+    m = re.search(r"^loc=([A-Z]{2})", warp_trace(), re.MULTILINE)
+    return m.group(1) if m else ""
+
+
+def _google_get(url):
+    return _curl(
+        ["-fsSL", "--max-time", str(CURL_TIMEOUT),
+         "-A", USER_AGENT,
+         "-H", f"Cookie: {GOOGLE_CONSENT_COOKIE}",
+         "-H", "Accept-Language: en-US,en;q=0.9",
+         "--socks5-hostname", WARP_PROXY],
+        url,
+    )
+
+
+def detect_google_country():
+    resp = _google_get("https://www.youtube.com")
+    m = re.search(r'"countryCode":"([A-Z]{2})"', resp)
+    if m:
+        return m.group(1)
+
+    resp = _google_get("https://www.google.com/search?q=test")
+    m = re.search(r'"gl":"([A-Z]{2})"', resp)
+    if m:
+        return m.group(1)
+
+    resp = _google_get("https://accounts.google.com/")
+    m = re.search(r'"countryCode":"([A-Z]{2})"', resp)
+    if m:
+        return m.group(1)
+
+    return ""
+
+
+# ===========================================================================
+# Restart
+# ===========================================================================
+
+def compose_restart():
+    cmd = ["docker", "compose", "-f", os.path.join(COMPOSE_DIR, COMPOSE_FILE), "restart"]
+    if COMPOSE_SERVICE:
+        cmd.append(COMPOSE_SERVICE)
+    log("INFO", f"running: {' '.join(cmd)}")
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return json.load(resp)
-    except urllib.error.HTTPError as e:
-        _log_http_error("POST", path, e)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        ok = r.returncode == 0
+        out = (r.stdout + r.stderr).strip()
+        return ok, out
+    except subprocess.TimeoutExpired:
+        return False, "docker compose restart timed out"
     except Exception as e:
-        print(f"POST {path} failed: {e}", flush=True)
-    return None
+        return False, f"{type(e).__name__}: {e}"
 
 
-def coordinator_get(path: str) -> dict | None:
-    req = urllib.request.Request(f"{COORDINATOR_URL}{path}", headers=_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            return json.load(resp)
-    except urllib.error.HTTPError as e:
-        _log_http_error("GET", path, e)
-    except Exception as e:
-        print(f"GET {path} failed: {e}", flush=True)
-    return None
+def wait_warp_up():
+    deadline = time.time() + WARP_BOOT_TIMEOUT
+    while time.time() < deadline:
+        if warp_alive():
+            return True
+        time.sleep(3)
+    return False
 
 
-# ---------------------------------------------------------------------------
+def post_restart_report():
+    if not wait_warp_up():
+        return f"⚠️ WARP did not come up within {WARP_BOOT_TIMEOUT}s"
+    country = detect_google_country()
+    cc = warp_exit_country()
+    ip = warp_exit_ip()
+    lines = [f"Google now: {country or '?'}"]
+    if cc:
+        lines.append(f"Cloudflare loc: {cc}")
+    if ip:
+        lines.append(f"Exit IP: {ip}")
+    if country == "RU":
+        lines.append("🔴 still RU")
+    return "\n".join(lines)
+
+
+def do_restart_and_report():
+    log("INFO", "restart: running docker compose restart")
+    ok, out = compose_restart()
+    if not ok:
+        log("ERROR", f"restart: compose failed: {out}")
+        return False, f"compose restart failed:\n{out}"
+
+    log("INFO", "restart: compose ok, waiting for WARP")
+    report = post_restart_report()
+    full = f"{out}\n\n--- after restart ---\n{report}" if out else report
+    return True, full
+
+
+# ===========================================================================
 # Command handling
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
-def handle_command(c: dict) -> None:
+def handle_command(c):
     cid = c.get("id")
-    cmd = c.get("cmd")
+    name = c.get("cmd")
+    log("INFO", f"received cmd#{cid}: {name}")
 
-    if cmd != "restart":
-        coordinator_post(
-            "/result",
-            {"id": cid, "ok": False, "output": f"unknown command: {cmd}"},
-        )
+    if name != "restart":
+        queue_result(cid, False, f"unknown command: {name}")
         return
 
-    ok, out = do_restart()
+    ok, out = do_restart_and_report()
     if ok:
-        write_last_restart(int(time.time()))
-        report = post_restart_report()
-        out = f"{out}\n\n--- after restart ---\n{report}" if out else report
+        set_last_restart(int(time.time()))
 
-    coordinator_post("/result", {"id": cid, "ok": ok, "output": out[-4000:]})
+    sent, _ = http_post("/result", {"id": cid, "ok": ok, "output": out[-4000:]})
+    if not sent:
+        queue_result(cid, ok, out[-4000:])
+    else:
+        log("INFO", f"reported cmd#{cid}: ok={ok}")
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Main loop
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
-def main() -> int:
-    print(f"agent started node={NODE_NAME} coordinator={COORDINATOR_URL}", flush=True)
+def main():
+    log("INFO", f"agent started node={NODE_NAME} coordinator={COORDINATOR_URL}")
 
-    last_check = 0
+    last_check     = 0
     last_heartbeat = 0
-    last_restart = read_last_restart()
+    last_restart   = get_last_restart()
     google_country = ""
-    alive = False
+    alive          = False
 
     while True:
         t = time.time()
 
-        # 1) Periodic Google country probe, auto-restart on RU.
+        # 1. Periodic Google check + auto-restart on RU.
         if t - last_check >= CHECK_INTERVAL:
             last_check = t
             if warp_alive():
                 alive = True
                 google_country = detect_google_country()
-                print(f"check: google={google_country or '?'}", flush=True)
-
-                if google_country == "RU" and t - last_restart >= RESTART_COOLDOWN:
-                    ok, out = do_restart()
-                    if ok:
-                        last_restart = int(t)
-                        write_last_restart(last_restart)
-                        report = post_restart_report()
-                        coordinator_post(
-                            "/notify",
-                            {
-                                "text": (
-                                    "🇷🇺 Google=RU detected, WARP restarted\n"
-                                    f"{report}"
-                                )
-                            },
-                        )
-                        print("auto-restart ok", flush=True)
+                log("INFO", f"check: google={google_country or '?'}")
+                if google_country == "RU":
+                    if t - last_restart >= RESTART_COOLDOWN:
+                        log("WARN", "auto: Google=RU, restarting")
+                        ok, out = do_restart_and_report()
+                        if ok:
+                            last_restart = int(t)
+                            set_last_restart(last_restart)
+                            http_post("/notify", {
+                                "text": "🇷🇺 Google=RU detected, WARP restarted\n" + out
+                            })
+                            log("INFO", "auto-restart ok")
+                        else:
+                            http_post("/notify", {
+                                "text": f"❌ auto-restart failed: {out[:500]}"
+                            })
+                            log("ERROR", f"auto-restart failed: {out}")
                     else:
-                        coordinator_post(
-                            "/notify",
-                            {"text": f"❌ auto-restart failed: {out[:500]}"},
-                        )
-                        print(f"auto-restart failed: {out}", flush=True)
+                        log("INFO", "auto: RU but cooldown active")
             else:
                 alive = False
                 google_country = ""
-                print("warp unreachable", flush=True)
+                log("WARN", "warp unreachable")
 
-        # 2) Heartbeat.
+        # 2. Heartbeat.
         if t - last_heartbeat >= HEARTBEAT_INTERVAL:
             last_heartbeat = t
-            coordinator_post(
-                "/heartbeat",
-                {
-                    "google_country": google_country or None,
-                    "warp_alive": alive,
-                    "last_restart": last_restart,
-                },
-            )
+            http_post("/heartbeat", {
+                "google_country": google_country or None,
+                "warp_alive": alive,
+                "last_restart": last_restart,
+            })
 
-        # 3) Pull and execute commands.
-        resp = coordinator_get("/commands")
-        if resp and isinstance(resp.get("commands"), list):
+        # 3. Flush any queued results from previous failures.
+        flush_pending()
+
+        # 4. Poll for commands.
+        ok, resp = http_get("/commands")
+        if ok and resp and isinstance(resp.get("commands"), list):
             for c in resp["commands"]:
                 try:
                     handle_command(c)
                 except Exception as e:
-                    print(f"handle_command failed: {e}", flush=True)
+                    log("ERROR", f"handle_command: {type(e).__name__}: {e}")
+                    queue_result(c.get("id"), False,
+                                 f"handler crashed: {type(e).__name__}: {e}")
 
         time.sleep(POLL_INTERVAL)
 
