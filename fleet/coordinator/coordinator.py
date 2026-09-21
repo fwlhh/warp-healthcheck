@@ -11,6 +11,7 @@ Design notes:
     COMMAND_LEASE seconds, up to COMMAND_MAX_ATTEMPTS times.
 """
 
+import contextlib
 import json
 import os
 import secrets
@@ -24,10 +25,10 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-
 # ===========================================================================
 # Config
 # ===========================================================================
+
 
 def env(key, default=None, required=False):
     val = os.environ.get(key, default)
@@ -37,16 +38,16 @@ def env(key, default=None, required=False):
     return val or ""
 
 
-HTTP_HOST            = env("HTTP_HOST", "0.0.0.0")
-HTTP_PORT            = int(env("HTTP_PORT", "8080"))
-DB_PATH              = env("DB_PATH", "/var/lib/warp-coordinator/coordinator.db")
-STALE_AFTER          = int(env("STALE_AFTER", "180"))
-COMMAND_LEASE        = int(env("COMMAND_LEASE", "120"))
+HTTP_HOST = env("HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(env("HTTP_PORT", "8080"))
+DB_PATH = env("DB_PATH", "/var/lib/warp-coordinator/coordinator.db")
+STALE_AFTER = int(env("STALE_AFTER", "180"))
+COMMAND_LEASE = int(env("COMMAND_LEASE", "120"))
 COMMAND_MAX_ATTEMPTS = int(env("COMMAND_MAX_ATTEMPTS", "3"))
-POLL_TIMEOUT         = int(env("POLL_TIMEOUT", "25"))
-LOG_LEVEL            = env("LOG_LEVEL", "INFO").upper()
+POLL_TIMEOUT = int(env("POLL_TIMEOUT", "25"))
+LOG_LEVEL = env("LOG_LEVEL", "INFO").upper()
 
-TG_TOKEN   = ""
+TG_TOKEN = ""
 TG_CHAT_ID = 0
 
 
@@ -79,6 +80,7 @@ def log(level, msg):
 # Database
 # ===========================================================================
 
+
 def now() -> int:
     return int(time.time())
 
@@ -102,10 +104,10 @@ def _migrate_commands(conn):
     cols = _table_columns(conn, "commands")
     additions = [
         ("delivered_at", "INTEGER"),
-        ("attempts",     "INTEGER NOT NULL DEFAULT 0"),
-        ("ok",           "INTEGER"),
-        ("output",       "TEXT"),
-        ("result_at",    "INTEGER"),
+        ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+        ("ok", "INTEGER"),
+        ("output", "TEXT"),
+        ("result_at", "INTEGER"),
     ]
     for name, typ in additions:
         if name not in cols:
@@ -118,8 +120,8 @@ def _migrate_nodes(conn):
     additions = [
         ("last_heartbeat", "INTEGER NOT NULL DEFAULT 0"),
         ("google_country", "TEXT"),
-        ("warp_alive",     "INTEGER NOT NULL DEFAULT 0"),
-        ("last_restart",   "INTEGER NOT NULL DEFAULT 0"),
+        ("warp_alive", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_restart", "INTEGER NOT NULL DEFAULT 0"),
     ]
     for name, typ in additions:
         if name not in cols:
@@ -196,11 +198,12 @@ def meta_set(key, value):
 # Telegram transport
 # ===========================================================================
 
+
 class TelegramAuthError(Exception):
     pass
 
 
-class TelegramConflict(Exception):
+class TelegramConflictError(Exception):
     pass
 
 
@@ -217,25 +220,31 @@ def tg_call(method, timeout=40, **params):
             return json.load(resp)
     except urllib.error.HTTPError as e:
         if e.code == 401:
-            raise TelegramAuthError(f"{method}: 401 unauthorized")
+            raise TelegramAuthError(f"{method}: 401 unauthorized") from e
         if e.code == 409:
-            raise TelegramConflict(f"{method}: 409 conflict")
-        raise TelegramTransportError(f"{method}: HTTP {e.code}")
+            raise TelegramConflictError(f"{method}: 409 conflict") from e
+        raise TelegramTransportError(f"{method}: HTTP {e.code}") from e
     except urllib.error.URLError as e:
-        raise TelegramTransportError(f"{method}: {e.reason}")
+        raise TelegramTransportError(f"{method}: {e.reason}") from e
     except Exception as e:
-        raise TelegramTransportError(f"{method}: {type(e).__name__}: {e}")
+        raise TelegramTransportError(f"{method}: {type(e).__name__}: {e}") from e
 
 
 def tg_send(text):
     try:
-        tg_call("sendMessage", timeout=20, chat_id=TG_CHAT_ID, text=text,
-                parse_mode="HTML", disable_web_page_preview="true")
+        tg_call(
+            "sendMessage",
+            timeout=20,
+            chat_id=TG_CHAT_ID,
+            text=text,
+            parse_mode="HTML",
+            disable_web_page_preview="true",
+        )
     except TelegramAuthError as e:
         log("ERROR", f"sendMessage: {e}")
     except TelegramTransportError as e:
         log("WARN", f"sendMessage: {e}")
-    except TelegramConflict:
+    except TelegramConflictError:
         # Should not happen for sendMessage, but catch anyway.
         log("WARN", "sendMessage: 409 conflict")
 
@@ -243,6 +252,7 @@ def tg_send(text):
 # ===========================================================================
 # Formatting
 # ===========================================================================
+
 
 def fmt_dur(sec):
     sec = max(0, int(sec))
@@ -392,7 +402,9 @@ def cmd_logs(name):
         return
     icon = "✅" if r["ok"] else "❌"
     body = esc(r["output"] or "")[:3000]
-    tg_send(f"{icon} <b>{esc(name)}</b> cmd#{r['id']} ({r['command']})\n<pre>{body}</pre>")
+    tg_send(
+        f"{icon} <b>{esc(name)}</b> cmd#{r['id']} ({r['command']})\n<pre>{body}</pre>"
+    )
 
 
 def cmd_health():
@@ -471,15 +483,19 @@ def bot_loop():
 
     while True:
         try:
-            data = tg_call("getUpdates", timeout=POLL_TIMEOUT + 10,
-                           offset=offset, timeout_s=POLL_TIMEOUT,
-                           allowed_updates='["message"]')
+            data = tg_call(
+                "getUpdates",
+                timeout=POLL_TIMEOUT + 10,
+                offset=offset,
+                timeout_s=POLL_TIMEOUT,
+                allowed_updates='["message"]',
+            )
             backoff = 5
         except TelegramAuthError as e:
             log("ERROR", f"bot_loop: {e}; sleeping 3600s")
             time.sleep(3600)
             continue
-        except TelegramConflict:
+        except TelegramConflictError:
             log("WARN", f"bot_loop: 409 conflict; backoff {backoff}s")
             _update_state(bot_alive=False)
             time.sleep(backoff)
@@ -523,10 +539,8 @@ def bot_loop():
                 handle_command(text)
             except Exception as e:
                 log("ERROR", f"handle_command error: {type(e).__name__}: {e}")
-                try:
+                with contextlib.suppress(Exception):
                     tg_send(f"⚠️ command failed: {esc(type(e).__name__)}")
-                except Exception:
-                    pass
 
         if now() - stats_last >= 3600:
             log("INFO", f"stats: offset={offset} healthy")
@@ -536,6 +550,7 @@ def bot_loop():
 # ===========================================================================
 # Command requeue watchdog
 # ===========================================================================
+
 
 def requeue_watchdog():
     """Return commands whose lease expired to the pending queue, and
@@ -580,6 +595,7 @@ def requeue_watchdog():
 # HTTP API
 # ===========================================================================
 
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "warp-coordinator/2.0"
 
@@ -610,7 +626,9 @@ class Handler(BaseHTTPRequestHandler):
             return None
         conn = db_connect()
         try:
-            r = conn.execute("SELECT token FROM nodes WHERE name = ?", (name,)).fetchone()
+            r = conn.execute(
+                "SELECT token FROM nodes WHERE name = ?", (name,)
+            ).fetchone()
         finally:
             conn.close()
         if not r or not secrets.compare_digest(r["token"], token):
@@ -656,14 +674,17 @@ class Handler(BaseHTTPRequestHandler):
             ).fetchone()["c"]
         finally:
             conn.close()
-        self.reply(200, {
-            "ok": True,
-            "bot_alive": s.get("bot_alive", False),
-            "last_poll_age": now() - s.get("last_poll_ts", 0),
-            "offset": s.get("offset", 0),
-            "nodes": nodes,
-            "commands_pending": pending,
-        })
+        self.reply(
+            200,
+            {
+                "ok": True,
+                "bot_alive": s.get("bot_alive", False),
+                "last_poll_age": now() - s.get("last_poll_ts", 0),
+                "offset": s.get("offset", 0),
+                "nodes": nodes,
+                "commands_pending": pending,
+            },
+        )
 
     def r_heartbeat(self):
         name = self.auth()
@@ -676,9 +697,13 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute(
                 "UPDATE nodes SET last_heartbeat = ?, google_country = ?, "
                 "warp_alive = ?, last_restart = ? WHERE name = ?",
-                (now(), b.get("google_country") or None,
-                 1 if b.get("warp_alive") else 0,
-                 int(b.get("last_restart") or 0), name),
+                (
+                    now(),
+                    b.get("google_country") or None,
+                    1 if b.get("warp_alive") else 0,
+                    int(b.get("last_restart") or 0),
+                    name,
+                ),
             )
         finally:
             conn.close()
@@ -712,7 +737,9 @@ class Handler(BaseHTTPRequestHandler):
                 log("INFO", f"delivered {len(rows)} command(s) to {name}")
         finally:
             conn.close()
-        self.reply(200, {"commands": [{"id": r["id"], "cmd": r["command"]} for r in rows]})
+        self.reply(
+            200, {"commands": [{"id": r["id"], "cmd": r["command"]} for r in rows]}
+        )
 
     def r_result(self):
         name = self.auth()
@@ -734,7 +761,9 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
         log("INFO", f"result cmd#{cid} from {name}: ok={ok}")
         icon = "✅" if ok else "❌"
-        tg_send(f"{icon} <code>{esc(name)}</code> cmd#{cid} finished\n<pre>{esc(out)[:1500]}</pre>")
+        tg_send(
+            f"{icon} <code>{esc(name)}</code> cmd#{cid} finished\n<pre>{esc(out)[:1500]}</pre>"
+        )
         self.reply(200, {"ok": True})
 
     def r_notify(self):
@@ -752,6 +781,7 @@ class Handler(BaseHTTPRequestHandler):
 # ===========================================================================
 # CLI
 # ===========================================================================
+
 
 def cli_add_node(name):
     token = secrets.token_urlsafe(32)
@@ -794,20 +824,25 @@ def cli_list_nodes():
     for r in rows:
         age = t - r["last_heartbeat"] if r["last_heartbeat"] else -1
         age_s = f"{age}s" if age >= 0 else "never"
-        print(f"{r['name']:30s} hb={age_s:>8s} "
-              f"country={r['google_country'] or '?':>3s} "
-              f"alive={'yes' if r['warp_alive'] else 'no'}")
+        print(
+            f"{r['name']:30s} hb={age_s:>8s} "
+            f"country={r['google_country'] or '?':>3s} "
+            f"alive={'yes' if r['warp_alive'] else 'no'}"
+        )
 
 
 # ===========================================================================
 # Server / main
 # ===========================================================================
 
+
 def sanity_check():
     try:
         me = tg_call("getMe", timeout=10)
         if me and me.get("ok"):
-            log("INFO", f"telegram bot @{(me.get('result') or {}).get('username', '?')}")
+            log(
+                "INFO", f"telegram bot @{(me.get('result') or {}).get('username', '?')}"
+            )
     except TelegramAuthError:
         print("FATAL: TG_TOKEN is invalid", file=sys.stderr)
         sys.exit(1)
@@ -850,8 +885,10 @@ def run_server():
 def main():
     if len(sys.argv) < 2:
         print(__doc__)
-        print("Usage:\n  coordinator.py run\n  coordinator.py add-node <name>\n"
-              "  coordinator.py remove-node <name>\n  coordinator.py list-nodes")
+        print(
+            "Usage:\n  coordinator.py run\n  coordinator.py add-node <name>\n"
+            "  coordinator.py remove-node <name>\n  coordinator.py list-nodes"
+        )
         return 1
     cmd = sys.argv[1]
     if cmd == "run":

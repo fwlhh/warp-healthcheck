@@ -9,6 +9,7 @@ Design notes:
   * Every state transition is logged.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -18,10 +19,10 @@ import time
 import urllib.error
 import urllib.request
 
-
 # ===========================================================================
 # Config
 # ===========================================================================
+
 
 def env(key, default=None, required=False):
     val = os.environ.get(key, default)
@@ -31,26 +32,26 @@ def env(key, default=None, required=False):
     return val or ""
 
 
-COORDINATOR_URL    = env("COORDINATOR_URL", required=True).rstrip("/")
-NODE_NAME          = env("NODE_NAME", required=True)
-NODE_TOKEN         = env("NODE_TOKEN", required=True)
+COORDINATOR_URL = env("COORDINATOR_URL", required=True).rstrip("/")
+NODE_NAME = env("NODE_NAME", required=True)
+NODE_TOKEN = env("NODE_TOKEN", required=True)
 
-WARP_PROXY         = env("WARP_PROXY", "127.0.0.1:1080")
-COMPOSE_DIR        = env("COMPOSE_DIR", "/opt/warp")
-COMPOSE_FILE       = env("COMPOSE_FILE", "docker-compose.yml")
-COMPOSE_SERVICE    = env("COMPOSE_SERVICE", "warp")
+WARP_PROXY = env("WARP_PROXY", "127.0.0.1:1080")
+COMPOSE_DIR = env("COMPOSE_DIR", "/opt/warp")
+COMPOSE_FILE = env("COMPOSE_FILE", "docker-compose.yml")
+COMPOSE_SERVICE = env("COMPOSE_SERVICE", "warp")
 
 HEARTBEAT_INTERVAL = int(env("HEARTBEAT_INTERVAL", "60"))
-POLL_INTERVAL      = int(env("POLL_INTERVAL", "5"))
-CHECK_INTERVAL     = int(env("CHECK_INTERVAL", "300"))
-RESTART_COOLDOWN   = int(env("RESTART_COOLDOWN", "300"))
-CURL_TIMEOUT       = int(env("CURL_TIMEOUT", "30"))
-HTTP_TIMEOUT       = int(env("HTTP_TIMEOUT", "20"))
-WARP_BOOT_TIMEOUT  = int(env("WARP_BOOT_TIMEOUT", "60"))
-LOG_LEVEL          = env("LOG_LEVEL", "INFO").upper()
+POLL_INTERVAL = int(env("POLL_INTERVAL", "5"))
+CHECK_INTERVAL = int(env("CHECK_INTERVAL", "300"))
+RESTART_COOLDOWN = int(env("RESTART_COOLDOWN", "300"))
+CURL_TIMEOUT = int(env("CURL_TIMEOUT", "30"))
+HTTP_TIMEOUT = int(env("HTTP_TIMEOUT", "20"))
+WARP_BOOT_TIMEOUT = int(env("WARP_BOOT_TIMEOUT", "60"))
+LOG_LEVEL = env("LOG_LEVEL", "INFO").upper()
 
-STATE_DIR   = env("STATE_DIR", "/var/lib/warp-agent")
-STATE_FILE  = os.path.join(STATE_DIR, "state.json")
+STATE_DIR = env("STATE_DIR", "/var/lib/warp-agent")
+STATE_FILE = os.path.join(STATE_DIR, "state.json")
 PENDING_DIR = os.path.join(STATE_DIR, "pending")
 
 USER_AGENT = (
@@ -81,6 +82,7 @@ def log(level, msg):
 # ===========================================================================
 # State
 # ===========================================================================
+
 
 def _load_state():
     try:
@@ -115,6 +117,7 @@ def set_last_restart(ts):
 # Pending results queue
 # ===========================================================================
 
+
 def _pending_path(cid):
     return os.path.join(PENDING_DIR, f"{cid}.json")
 
@@ -124,8 +127,10 @@ def queue_result(cid, ok, output):
         os.makedirs(PENDING_DIR, exist_ok=True)
         tmp = _pending_path(cid) + ".tmp"
         with open(tmp, "w") as f:
-            json.dump({"id": cid, "ok": ok, "output": output,
-                       "queued_at": int(time.time())}, f)
+            json.dump(
+                {"id": cid, "ok": ok, "output": output, "queued_at": int(time.time())},
+                f,
+            )
         os.replace(tmp, _pending_path(cid))
         log("WARN", f"queued result cmd#{cid} for later delivery")
     except Exception as e:
@@ -151,24 +156,21 @@ def flush_pending():
                 payload = json.load(f)
         except Exception as e:
             log("ERROR", f"pending read {fn}: {e}")
-            try:
+            with contextlib.suppress(Exception):
                 os.remove(path)
-            except Exception:
-                pass
             continue
 
         ok, _ = http_post("/result", payload)
         if ok:
             log("INFO", f"flushed pending result cmd#{payload.get('id')}")
-            try:
+            with contextlib.suppress(Exception):
                 os.remove(path)
-            except Exception:
-                pass
 
 
 # ===========================================================================
 # HTTP client
 # ===========================================================================
+
 
 def _headers():
     return {
@@ -187,8 +189,10 @@ def _http(method, path, body=None):
             return True, json.load(resp)
     except urllib.error.HTTPError as e:
         if e.code == 401:
-            log("ERROR", f"{method} {path}: 401 unauthorized "
-                         f"(check NODE_NAME/NODE_TOKEN)")
+            log(
+                "ERROR",
+                f"{method} {path}: 401 unauthorized (check NODE_NAME/NODE_TOKEN)",
+            )
         else:
             log("WARN", f"{method} {path}: HTTP {e.code}")
         return False, None
@@ -209,11 +213,14 @@ def http_get(path):
 # WARP probes
 # ===========================================================================
 
+
 def _curl(opts, url):
     try:
         r = subprocess.run(
             ["curl", *opts, url],
-            capture_output=True, text=True, timeout=CURL_TIMEOUT + 15,
+            capture_output=True,
+            text=True,
+            timeout=CURL_TIMEOUT + 15,
         )
         return r.stdout
     except subprocess.TimeoutExpired:
@@ -251,11 +258,19 @@ def warp_exit_country():
 
 def _google_get(url):
     return _curl(
-        ["-fsSL", "--max-time", str(CURL_TIMEOUT),
-         "-A", USER_AGENT,
-         "-H", f"Cookie: {GOOGLE_CONSENT_COOKIE}",
-         "-H", "Accept-Language: en-US,en;q=0.9",
-         "--socks5-hostname", WARP_PROXY],
+        [
+            "-fsSL",
+            "--max-time",
+            str(CURL_TIMEOUT),
+            "-A",
+            USER_AGENT,
+            "-H",
+            f"Cookie: {GOOGLE_CONSENT_COOKIE}",
+            "-H",
+            "Accept-Language: en-US,en;q=0.9",
+            "--socks5-hostname",
+            WARP_PROXY,
+        ],
         url,
     )
 
@@ -283,8 +298,15 @@ def detect_google_country():
 # Restart
 # ===========================================================================
 
+
 def compose_restart():
-    cmd = ["docker", "compose", "-f", os.path.join(COMPOSE_DIR, COMPOSE_FILE), "restart"]
+    cmd = [
+        "docker",
+        "compose",
+        "-f",
+        os.path.join(COMPOSE_DIR, COMPOSE_FILE),
+        "restart",
+    ]
     if COMPOSE_SERVICE:
         cmd.append(COMPOSE_SERVICE)
     log("INFO", f"running: {' '.join(cmd)}")
@@ -341,6 +363,7 @@ def do_restart_and_report():
 # Command handling
 # ===========================================================================
 
+
 def handle_command(c):
     cid = c.get("id")
     name = c.get("cmd")
@@ -365,14 +388,15 @@ def handle_command(c):
 # Main loop
 # ===========================================================================
 
+
 def main():
     log("INFO", f"agent started node={NODE_NAME} coordinator={COORDINATOR_URL}")
 
-    last_check     = 0
+    last_check = 0
     last_heartbeat = 0
-    last_restart   = get_last_restart()
+    last_restart = get_last_restart()
     google_country = ""
-    alive          = False
+    alive = False
 
     while True:
         t = time.time()
@@ -391,14 +415,19 @@ def main():
                         if ok:
                             last_restart = int(t)
                             set_last_restart(last_restart)
-                            http_post("/notify", {
-                                "text": "🇷🇺 Google=RU detected, WARP restarted\n" + out
-                            })
+                            http_post(
+                                "/notify",
+                                {
+                                    "text": "🇷🇺 Google=RU detected, WARP restarted\n"
+                                    + out
+                                },
+                            )
                             log("INFO", "auto-restart ok")
                         else:
-                            http_post("/notify", {
-                                "text": f"❌ auto-restart failed: {out[:500]}"
-                            })
+                            http_post(
+                                "/notify",
+                                {"text": f"❌ auto-restart failed: {out[:500]}"},
+                            )
                             log("ERROR", f"auto-restart failed: {out}")
                     else:
                         log("INFO", "auto: RU but cooldown active")
@@ -410,11 +439,14 @@ def main():
         # 2. Heartbeat.
         if t - last_heartbeat >= HEARTBEAT_INTERVAL:
             last_heartbeat = t
-            http_post("/heartbeat", {
-                "google_country": google_country or None,
-                "warp_alive": alive,
-                "last_restart": last_restart,
-            })
+            http_post(
+                "/heartbeat",
+                {
+                    "google_country": google_country or None,
+                    "warp_alive": alive,
+                    "last_restart": last_restart,
+                },
+            )
 
         # 3. Flush any queued results from previous failures.
         flush_pending()
@@ -427,8 +459,9 @@ def main():
                     handle_command(c)
                 except Exception as e:
                     log("ERROR", f"handle_command: {type(e).__name__}: {e}")
-                    queue_result(c.get("id"), False,
-                                 f"handler crashed: {type(e).__name__}: {e}")
+                    queue_result(
+                        c.get("id"), False, f"handler crashed: {type(e).__name__}: {e}"
+                    )
 
         time.sleep(POLL_INTERVAL)
 
