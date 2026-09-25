@@ -2,13 +2,19 @@
 """warp-coordinator — Telegram bot + HTTP API for warp-agents.
 
 Design notes:
-  * Bot long-polling runs in the main thread. If it dies, the process dies.
+  * Bot long-polling runs in a daemon thread. If it dies, the process
+    keeps serving HTTP but no commands arrive; the /health endpoint
+    exposes bot_alive so external monitoring can catch this.
   * HTTP server runs in a daemon thread.
   * All external calls have explicit timeouts.
   * All state changes are logged.
-  * /health endpoint exposes internal state for external monitoring.
   * Commands have a lease; undelivered results are re-queued after
     COMMAND_LEASE seconds, up to COMMAND_MAX_ATTEMPTS times.
+  * After every restart the coordinator updates the node's stored
+    google_country immediately, instead of waiting for the next
+    heartbeat.
+  * If a restart ends with an unknown country, the coordinator queues
+    another restart automatically, up to RETRY_UNKNOWN_LIMIT times.
 """
 
 import contextlib
@@ -46,6 +52,7 @@ DB_PATH = Path(env("DB_PATH", "/var/lib/warp-coordinator/coordinator.db"))
 STALE_AFTER = int(env("STALE_AFTER", "180"))
 COMMAND_LEASE = int(env("COMMAND_LEASE", "120"))
 COMMAND_MAX_ATTEMPTS = int(env("COMMAND_MAX_ATTEMPTS", "3"))
+RETRY_UNKNOWN_LIMIT = int(env("RETRY_UNKNOWN_LIMIT", "10"))
 POLL_TIMEOUT = int(env("POLL_TIMEOUT", "25"))
 LOG_LEVEL = env("LOG_LEVEL", "INFO").upper()
 
@@ -142,7 +149,36 @@ def db_init() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = db_connect()
     try:
-        conn.executescript(...)
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS nodes (
+                name           TEXT PRIMARY KEY,
+                token          TEXT NOT NULL,
+                registered_at  INTEGER NOT NULL,
+                last_heartbeat INTEGER NOT NULL DEFAULT 0,
+                google_country TEXT,
+                warp_alive     INTEGER NOT NULL DEFAULT 0,
+                last_restart   INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS commands (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                node         TEXT NOT NULL,
+                command      TEXT NOT NULL,
+                created_at   INTEGER NOT NULL,
+                delivered_at INTEGER,
+                attempts     INTEGER NOT NULL DEFAULT 0,
+                ok           INTEGER,
+                output       TEXT,
+                result_at    INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_commands_pending
+                ON commands(node, result_at, delivered_at);
+            CREATE TABLE IF NOT EXISTS meta (
+                key   TEXT PRIMARY KEY,
+                value TEXT
+            );
+            """
+        )
         _migrate_nodes(conn)
         _migrate_commands(conn)
         conn.execute("UPDATE commands SET attempts = 0 WHERE attempts IS NULL")
@@ -188,12 +224,17 @@ class TelegramTransportError(Exception):
     pass
 
 
-def tg_call(method, timeout=40, **params):
+def tg_call(method, http_timeout=40, **params):
+    """Call the Telegram Bot API.
+
+    http_timeout is the urllib socket timeout. Telegram's own long-poll
+    timeout must be passed explicitly as `timeout=` and lands in **params.
+    """
     url = f"https://api.telegram.org/bot{TG_TOKEN}/{method}"
     data = urllib.parse.urlencode(params).encode()
     req = urllib.request.Request(url, data=data)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=http_timeout) as resp:
             return json.load(resp)
     except urllib.error.HTTPError as e:
         if e.code == 401:
@@ -211,7 +252,7 @@ def tg_send(text):
     try:
         tg_call(
             "sendMessage",
-            timeout=20,
+            http_timeout=20,
             chat_id=TG_CHAT_ID,
             text=text,
             parse_mode="HTML",
@@ -222,7 +263,6 @@ def tg_send(text):
     except TelegramTransportError as e:
         log("WARN", f"sendMessage: {e}")
     except TelegramConflictError:
-        # Should not happen for sendMessage, but catch anyway.
         log("WARN", "sendMessage: 409 conflict")
 
 
@@ -244,6 +284,98 @@ def fmt_dur(sec):
 
 def esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _format_restart_message(name, meta, kind):
+    """Build the Telegram card for a restart event.
+
+    kind: 'cmd#N restart' (manual) or 'auto-restart' (triggered by RU).
+    """
+    country = (meta.get("country") or "").strip()
+    still_ru = bool(meta.get("still_ru"))
+    warp_up = bool(meta.get("warp_up"))
+
+    if not warp_up:
+        icon = "🔴"
+    elif still_ru:
+        icon = "🟡"
+    elif country and country != "?":
+        icon = "🟢"
+    else:
+        icon = "🔴"
+
+    lines = [f"{icon} <code>{esc(name)}</code> · {esc(kind)}"]
+    if warp_up:
+        lines.append(f"Google now: <b>{esc(country or '?')}</b>")
+        cc = meta.get("cloudflare_loc")
+        if cc:
+            lines.append(f"Cloudflare loc: <code>{esc(cc)}</code>")
+        ip = meta.get("exit_ip")
+        if ip:
+            lines.append(f"Exit IP: <code>{esc(ip)}</code>")
+        if still_ru:
+            lines.append("🔴 still RU")
+    else:
+        lines.append("⚠️ WARP did not come up")
+    return "\n".join(lines)
+
+
+# ===========================================================================
+# Node state helpers
+# ===========================================================================
+
+
+def _apply_meta_to_node(name, meta):
+    """Update the node's stored country and last_restart from a report."""
+    country = (meta.get("country") or "").strip()
+    if not country or country == "?":
+        return
+    conn = db_connect()
+    try:
+        conn.execute(
+            "UPDATE nodes SET google_country = ?, last_restart = ? WHERE name = ?",
+            (country, now(), name),
+        )
+        conn.execute("DELETE FROM meta WHERE key = ?", (f"retry_unknown:{name}",))
+    finally:
+        conn.close()
+
+
+def _schedule_unknown_retry(name):
+    """Queue another restart if the last one ended with country == '?'."""
+    key = f"retry_unknown:{name}"
+    conn = db_connect()
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        count = int(row["value"]) if row else 0
+
+        if count >= RETRY_UNKNOWN_LIMIT:
+            conn.execute("DELETE FROM meta WHERE key = ?", (key,))
+            log("WARN", f"{name}: gave up after {RETRY_UNKNOWN_LIMIT} retries")
+            tg_send(
+                f"⚠️ <code>{esc(name)}</code>: Google country still unknown "
+                f"after {RETRY_UNKNOWN_LIMIT} restarts, giving up"
+            )
+            return
+
+        count += 1
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(count)),
+        )
+        conn.execute(
+            "INSERT INTO commands (node, command, created_at) "
+            "VALUES (?, 'restart', ?)",
+            (name, now()),
+        )
+    finally:
+        conn.close()
+    log("INFO", f"{name}: queued retry #{count} (country still unknown)")
+    tg_send(
+        f"🔁 <code>{esc(name)}</code>: country still unknown, "
+        f"queued retry #{count}/{RETRY_UNKNOWN_LIMIT}"
+    )
 
 
 # ===========================================================================
@@ -319,7 +451,6 @@ def cmd_restart(name):
         if not r:
             tg_send(f"Unknown node: <code>{esc(name)}</code>")
             return
-        # Deduplicate: skip if an identical command is already pending.
         pending = conn.execute(
             "SELECT id FROM commands WHERE node = ? AND command = 'restart' "
             "AND result_at IS NULL LIMIT 1",
@@ -462,14 +593,15 @@ def bot_loop():
         try:
             data = tg_call(
                 "getUpdates",
-                timeout=POLL_TIMEOUT + 10,
+                http_timeout=POLL_TIMEOUT + 10,
                 offset=offset,
-                timeout_s=POLL_TIMEOUT,
+                timeout=POLL_TIMEOUT,
                 allowed_updates='["message"]',
             )
             backoff = 5
         except TelegramAuthError as e:
             log("ERROR", f"bot_loop: {e}; sleeping 3600s")
+            _update_state(bot_alive=False)
             time.sleep(3600)
             continue
         except TelegramConflictError:
@@ -540,7 +672,6 @@ def requeue_watchdog():
             cutoff = t - COMMAND_LEASE
             conn = db_connect()
             try:
-                # expired lease → clear delivered_at so agent can pick again
                 cur = conn.execute(
                     "UPDATE commands SET delivered_at = NULL "
                     "WHERE result_at IS NULL AND delivered_at IS NOT NULL "
@@ -549,7 +680,6 @@ def requeue_watchdog():
                 )
                 requeued = cur.rowcount
 
-                # exceeded attempts → mark failed
                 cur = conn.execute(
                     "UPDATE commands SET ok = 0, output = ?, result_at = ? "
                     "WHERE result_at IS NULL AND attempts >= ?",
@@ -660,6 +790,7 @@ class Handler(BaseHTTPRequestHandler):
                 "offset": s.get("offset", 0),
                 "nodes": nodes,
                 "commands_pending": pending,
+                "retry_unknown_limit": RETRY_UNKNOWN_LIMIT,
             },
         )
 
@@ -723,10 +854,13 @@ class Handler(BaseHTTPRequestHandler):
         if not name:
             self.reply(401, {"error": "unauthorized"})
             return
+
         b = self.read_json()
         cid = b.get("id")
         ok = bool(b.get("ok"))
         out = str(b.get("output", ""))[:4000]
+        meta = b.get("meta") or {}
+
         conn = db_connect()
         try:
             conn.execute(
@@ -736,11 +870,20 @@ class Handler(BaseHTTPRequestHandler):
             )
         finally:
             conn.close()
-        log("INFO", f"result cmd#{cid} from {name}: ok={ok}")
-        icon = "✅" if ok else "❌"
-        tg_send(
-            f"{icon} <code>{esc(name)}</code> cmd#{cid} finished\n<pre>{esc(out)[:1500]}</pre>"
+
+        _apply_meta_to_node(name, meta)
+
+        country = (meta.get("country") or "").strip()
+        log(
+            "INFO",
+            f"result cmd#{cid} from {name}: ok={ok} country={country or '?'}",
         )
+
+        tg_send(_format_restart_message(name, meta, f"cmd#{cid} restart"))
+
+        if ok and meta.get("warp_up") and (not country or country == "?"):
+            _schedule_unknown_retry(name)
+
         self.reply(200, {"ok": True})
 
     def r_notify(self):
@@ -748,10 +891,19 @@ class Handler(BaseHTTPRequestHandler):
         if not name:
             self.reply(401, {"error": "unauthorized"})
             return
+
         b = self.read_json()
         text = str(b.get("text", ""))
-        if text:
+        meta = b.get("meta") or {}
+        reason = str(b.get("reason", ""))
+
+        _apply_meta_to_node(name, meta)
+
+        if reason == "auto" and meta:
+            tg_send(_format_restart_message(name, meta, "auto-restart"))
+        elif text:
             tg_send(f"[<code>{esc(name)}</code>] {esc(text)}")
+
         self.reply(200, {"ok": True})
 
 
@@ -780,6 +932,7 @@ def cli_remove_node(name):
     try:
         conn.execute("DELETE FROM nodes WHERE name = ?", (name,))
         conn.execute("DELETE FROM commands WHERE node = ?", (name,))
+        conn.execute("DELETE FROM meta WHERE key = ?", (f"retry_unknown:{name}",))
     finally:
         conn.close()
     print(f"Removed {name}")
@@ -815,7 +968,7 @@ def cli_list_nodes():
 
 def sanity_check():
     try:
-        me = tg_call("getMe", timeout=10)
+        me = tg_call("getMe", http_timeout=10)
         if me and me.get("ok"):
             log(
                 "INFO", f"telegram bot @{(me.get('result') or {}).get('username', '?')}"
@@ -827,7 +980,7 @@ def sanity_check():
         log("WARN", f"cannot reach Telegram at startup: {e}")
 
     try:
-        info = tg_call("getWebhookInfo", timeout=10)
+        info = tg_call("getWebhookInfo", http_timeout=10)
         if info and info.get("ok"):
             url = (info.get("result") or {}).get("url") or ""
             if url:

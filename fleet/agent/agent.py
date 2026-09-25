@@ -4,7 +4,8 @@
 Design notes:
   * Every HTTP call to the coordinator has a timeout and is retried on
     the next loop iteration.
-  * Results that fail to POST are queued to disk and re-sent later.
+  * Results that fail to POST are queued to disk and re-sent later,
+    together with the structured post-restart report.
   * Every subprocess call has a timeout.
   * Every state transition is logged.
 """
@@ -128,15 +129,23 @@ def _pending_path(cid: int) -> Path:
     return PENDING_DIR / f"{cid}.json"
 
 
-def queue_result(cid, ok, output):
+def queue_result(cid, ok, output, meta=None):
     try:
         PENDING_DIR.mkdir(parents=True, exist_ok=True)
         tmp = _pending_path(cid).with_suffix(".json.tmp")
-        tmp.write_text(json.dumps({
-            "id": cid, "ok": ok, "output": output,
-            "queued_at": int(time.time()),
-        }))
+        tmp.write_text(
+            json.dumps(
+                {
+                    "id": cid,
+                    "ok": ok,
+                    "output": output,
+                    "meta": meta or {},
+                    "queued_at": int(time.time()),
+                }
+            )
+        )
         tmp.replace(_pending_path(cid))
+        log("WARN", f"queued result cmd#{cid} for later delivery")
     except Exception as e:
         LOG.error(f"queue_result: {e}")
 
@@ -153,13 +162,11 @@ def flush_pending():
     files = _pending_files()
     if not files:
         return
-    for fn in files:
-        path = os.path.join(PENDING_DIR, fn)
+    for path in files:
         try:
-            with open(path) as f:
-                payload = json.load(f)
+            payload = json.loads(path.read_text())
         except Exception as e:
-            log("ERROR", f"pending read {fn}: {e}")
+            log("ERROR", f"pending read {path.name}: {e}")
             with contextlib.suppress(Exception):
                 path.unlink()
             continue
@@ -334,33 +341,55 @@ def wait_warp_up():
     return False
 
 
-def post_restart_report():
+def collect_post_restart_report() -> dict:
+    """Probe WARP and Google after a restart. Returns a structured dict."""
+    report = {
+        "warp_up": False,
+        "country": "",
+        "cloudflare_loc": "",
+        "exit_ip": "",
+        "still_ru": False,
+    }
     if not wait_warp_up():
-        return f"⚠️ WARP did not come up within {WARP_BOOT_TIMEOUT}s"
-    country = detect_google_country()
-    cc = warp_exit_country()
-    ip = warp_exit_ip()
-    lines = [f"Google now: {country or '?'}"]
+        return report
+    report["warp_up"] = True
+    report["country"] = detect_google_country()
+    report["cloudflare_loc"] = warp_exit_country()
+    report["exit_ip"] = warp_exit_ip()
+    report["still_ru"] = report["country"] == "RU"
+    return report
+
+
+def format_post_restart_report(report: dict) -> str:
+    """Human-readable fallback for logs and legacy paths."""
+    if not report.get("warp_up"):
+        return f"WARP did not come up within {WARP_BOOT_TIMEOUT}s"
+    country = report.get("country") or "?"
+    lines = [f"Google now: {country}"]
+    cc = report.get("cloudflare_loc")
     if cc:
         lines.append(f"Cloudflare loc: {cc}")
+    ip = report.get("exit_ip")
     if ip:
         lines.append(f"Exit IP: {ip}")
-    if country == "RU":
-        lines.append("🔴 still RU")
+    if report.get("still_ru"):
+        lines.append("still RU")
     return "\n".join(lines)
 
 
 def do_restart_and_report():
+    """Returns (ok, text_summary, structured_report)."""
     log("INFO", "restart: running docker compose restart")
     ok, out = compose_restart()
     if not ok:
         log("ERROR", f"restart: compose failed: {out}")
-        return False, f"compose restart failed:\n{out}"
+        return False, f"compose restart failed:\n{out}", {}
 
     log("INFO", "restart: compose ok, waiting for WARP")
-    report = post_restart_report()
-    full = f"{out}\n\n--- after restart ---\n{report}" if out else report
-    return True, full
+    report = collect_post_restart_report()
+    text = format_post_restart_report(report)
+    full = f"{out}\n\n--- after restart ---\n{text}" if out else text
+    return True, full, report
 
 
 # ===========================================================================
@@ -377,13 +406,14 @@ def handle_command(c):
         queue_result(cid, False, f"unknown command: {name}")
         return
 
-    ok, out = do_restart_and_report()
+    ok, out, report = do_restart_and_report()
     if ok:
         set_last_restart(int(time.time()))
 
-    sent, _ = http_post("/result", {"id": cid, "ok": ok, "output": out[-4000:]})
+    payload = {"id": cid, "ok": ok, "output": out[-4000:], "meta": report}
+    sent, _ = http_post("/result", payload)
     if not sent:
-        queue_result(cid, ok, out[-4000:])
+        queue_result(cid, ok, out[-4000:], meta=report)
     else:
         log("INFO", f"reported cmd#{cid}: ok={ok}")
 
@@ -416,22 +446,26 @@ def main():
                 if google_country == "RU":
                     if t - last_restart >= RESTART_COOLDOWN:
                         log("WARN", "auto: Google=RU, restarting")
-                        ok, out = do_restart_and_report()
+                        ok, out, report = do_restart_and_report()
                         if ok:
                             last_restart = int(t)
                             set_last_restart(last_restart)
                             http_post(
                                 "/notify",
                                 {
-                                    "text": "🇷🇺 Google=RU detected, WARP restarted\n"
-                                    + out
+                                    "text": (
+                                        "Google=RU detected, WARP restarted\n"
+                                        + format_post_restart_report(report)
+                                    ),
+                                    "meta": report,
+                                    "reason": "auto",
                                 },
                             )
                             log("INFO", "auto-restart ok")
                         else:
                             http_post(
                                 "/notify",
-                                {"text": f"❌ auto-restart failed: {out[:500]}"},
+                                {"text": f"auto-restart failed: {out[:500]}"},
                             )
                             log("ERROR", f"auto-restart failed: {out}")
                     else:
