@@ -74,5 +74,6 @@ test-single:
 
 test-fleet:
 	fleet/tests/run.sh
+	python3 -m unittest discover -s fleet/tests -p 'test_*.py' -v
 
 test: test-single test-fleet
