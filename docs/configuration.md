@@ -14,6 +14,8 @@
 | `CHECK_INTERVAL`   | no       | `300`                  | Seconds between Google checks                 |
 | `RESTART_COOLDOWN` | no       | `300`                  | Minimum seconds between restarts              |
 | `POLL_TIMEOUT`     | no       | `25`                   | Telegram long-polling timeout                 |
+| `POLL_BACKOFF_MIN` | no       | `5`                    | First retry delay (s) after a failed Telegram poll |
+| `POLL_BACKOFF_MAX` | no       | `60`                   | Cap for the doubling retry delay (s)          |
 | `CURL_TIMEOUT`     | no       | `10`                   | Timeout for Google probe                      |
 | `STATE_DIR`        | no       | `/var/lib/warp-bot`    | Where the restart timestamp lives             |
 

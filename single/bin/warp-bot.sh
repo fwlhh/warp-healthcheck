@@ -32,6 +32,8 @@ readonly COMPOSE_SERVICE="${COMPOSE_SERVICE:-warp}"
 readonly CHECK_INTERVAL="${CHECK_INTERVAL:-300}"
 readonly RESTART_COOLDOWN="${RESTART_COOLDOWN:-300}"
 readonly POLL_TIMEOUT="${POLL_TIMEOUT:-25}"
+readonly POLL_BACKOFF_MIN="${POLL_BACKOFF_MIN:-5}"
+readonly POLL_BACKOFF_MAX="${POLL_BACKOFF_MAX:-60}"
 readonly CURL_TIMEOUT="${CURL_TIMEOUT:-10}"
 readonly WARP_BOOT_TIMEOUT="${WARP_BOOT_TIMEOUT:-45}"
 
@@ -417,11 +419,15 @@ handle_updates() {
     -d "offset=${offset}" \
     -d 'allowed_updates=["message"]')
 
+  # An empty or non-ok reply means the poll itself failed (network down,
+  # DNS error, revoked token, 409 from a second poller). A healthy long poll
+  # blocks for POLL_TIMEOUT, so a failure returns instantly: the caller must
+  # back off or the main loop spins.
   if [[ -z "${updates}" ]]; then
-    return 0
+    return 1
   fi
   if ! jq -e '.ok == true' >/dev/null 2>&1 <<<"${updates}"; then
-    return 0
+    return 1
   fi
 
   local count
@@ -442,6 +448,22 @@ handle_updates() {
       dispatch_command "${text}" || log "handler error: ${text}"
     fi
   done < <(jq -c '.result[]' <<<"${updates}")
+  return 0
+}
+
+# Prints the next poll-failure delay: POLL_BACKOFF_MIN, then doubling,
+# capped at POLL_BACKOFF_MAX. $1 is the current delay (0 = no failures yet).
+next_backoff() {
+  local current="$1" next
+  if (( current <= 0 )); then
+    next="${POLL_BACKOFF_MIN}"
+  else
+    next=$(( current * 2 ))
+  fi
+  if (( next > POLL_BACKOFF_MAX )); then
+    next="${POLL_BACKOFF_MAX}"
+  fi
+  printf '%s' "${next}"
 }
 
 # ---------------------------------------------------------------------------
@@ -455,8 +477,15 @@ main() {
 
   log "bot started (node=${NODE_NAME}, chat_id=${TG_CHAT_ID}, interval=${CHECK_INTERVAL}s)"
 
+  local backoff=0
   while true; do
-    handle_updates
+    if handle_updates; then
+      backoff=0
+    else
+      backoff=$(next_backoff "${backoff}")
+      log "telegram poll failed; retrying in ${backoff}s"
+      sleep "${backoff}"
+    fi
     scheduled_check
   done
 }
