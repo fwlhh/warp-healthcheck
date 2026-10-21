@@ -13,7 +13,8 @@ SCRIPT="${PROJECT_ROOT}/bin/warp-bot.sh"
   export COMPOSE_FILE="does-not-exist.yml"
   # shellcheck disable=SC1090
   source "${SCRIPT}"
-  if require_config 2>/dev/null; then
+  # die() calls exit, so run it in a nested subshell and check its status.
+  if ( require_config ) 2>/dev/null; then
     printf 'expected failure for empty TG_TOKEN\n' >&2
     exit 1
   fi
@@ -33,7 +34,7 @@ SCRIPT="${PROJECT_ROOT}/bin/warp-bot.sh"
 
   # shellcheck disable=SC1090
   source "${SCRIPT}"
-  if require_config 2>/dev/null; then
+  if ( require_config ) 2>/dev/null; then
     printf 'expected failure for bad NODE_NAME\n' >&2
     exit 1
   fi
