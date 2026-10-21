@@ -114,6 +114,16 @@ def get_last_restart():
     return int(_load_state().get("last_restart", 0) or 0)
 
 
+def cooldown_remaining(now=None) -> int:
+    """Seconds left before another restart is allowed (0 = allowed now).
+
+    Always reads the persisted timestamp, so manual and automatic restarts
+    share one cooldown, matching the single-node bot (restart_warp()).
+    """
+    now = time.time() if now is None else now
+    return max(0, int(RESTART_COOLDOWN - (now - get_last_restart())))
+
+
 def set_last_restart(ts):
     s = _load_state()
     s["last_restart"] = int(ts)
@@ -406,9 +416,15 @@ def handle_command(c):
         queue_result(cid, False, f"unknown command: {name}")
         return
 
-    ok, out, report = do_restart_and_report()
-    if ok:
-        set_last_restart(int(time.time()))
+    remaining = cooldown_remaining()
+    if remaining > 0:
+        out = f"restart skipped: cooldown active ({remaining}s remaining)"
+        log("INFO", f"cmd#{cid}: {out}")
+        ok, report = False, {}
+    else:
+        ok, out, report = do_restart_and_report()
+        if ok:
+            set_last_restart(int(time.time()))
 
     payload = {"id": cid, "ok": ok, "output": out[-4000:], "meta": report}
     sent, _ = http_post("/result", payload)
@@ -429,7 +445,6 @@ def main():
 
     last_check = 0
     last_heartbeat = 0
-    last_restart = get_last_restart()
     google_country = ""
     alive = False
 
@@ -444,12 +459,11 @@ def main():
                 google_country = detect_google_country()
                 log("INFO", f"check: google={google_country or '?'}")
                 if google_country == "RU":
-                    if t - last_restart >= RESTART_COOLDOWN:
+                    if cooldown_remaining(t) == 0:
                         log("WARN", "auto: Google=RU, restarting")
                         ok, out, report = do_restart_and_report()
                         if ok:
-                            last_restart = int(t)
-                            set_last_restart(last_restart)
+                            set_last_restart(int(t))
                             http_post(
                                 "/notify",
                                 {
@@ -483,7 +497,7 @@ def main():
                 {
                     "google_country": google_country or None,
                     "warp_alive": alive,
-                    "last_restart": last_restart,
+                    "last_restart": get_last_restart(),
                 },
             )
 

@@ -52,7 +52,7 @@ extend-exclude = '''
 '''
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["fleet/tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
