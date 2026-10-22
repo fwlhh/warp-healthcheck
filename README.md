@@ -68,7 +68,7 @@ On every WARP node (repeat for each):
 git clone https://github.com/fwlhh/warp-healthcheck
 cd warp-healthcheck
 sudo make install-agent
-sudo nano /etc/warp-agent.env        # URL, NODE_NAME, NODE_TOKEN
+sudo nano /etc/warp-agent.env        # COORDINATOR_URL, NODE_NAME, NODE_TOKEN
 sudo systemctl enable --now warp-agent
 ```
 
