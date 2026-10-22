@@ -31,6 +31,11 @@ export COMPOSE_FILE="docker-compose.yml"
 export STATE_DIR="${tmp_state}"
 export STATE_FILE="${tmp_state}/last-restart"
 export OFFSET_FILE="${tmp_state}/offset"
+# Pin the values the test depends on instead of relying on the defaults:
+# the cooldown must outlast the first restart, and the (unreachable) mock
+# WARP proxy should not make that first restart wait for the full default
+# boot timeout.
+export RESTART_COOLDOWN=300 WARP_BOOT_TIMEOUT=1
 
 # shellcheck disable=SC1090
 source "${SCRIPT}"
