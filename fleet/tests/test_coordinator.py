@@ -289,5 +289,109 @@ class ResultIdempotencyTest(CoordinatorTestCase):
         self.assertEqual(len(self.sent), 1)
 
 
+class NodeInputValidationTest(CoordinatorTestCase):
+    """Reports come from nodes, i.e. from anyone holding a node token. They
+    end up in Telegram messages sent with parse_mode=HTML."""
+
+    EVIL = '<a href="https://evil.example/login">re-auth</a>'
+
+    def heartbeat(self, **fields):
+        return self.call("POST", "/heartbeat", {"warp_alive": True, **fields})
+
+    def stored(self, column):
+        (row,) = self.sql(f"SELECT {column} FROM nodes WHERE name = ?", self.NODE)
+        return row[column]
+
+    def test_heartbeat_country_is_normalised(self):
+        self.heartbeat(google_country="de")
+        self.assertEqual(self.stored("google_country"), "DE")
+
+    def test_heartbeat_with_markup_country_is_not_stored(self):
+        status, _ = self.heartbeat(google_country=self.EVIL)
+        self.assertEqual(status, 200)
+        self.assertIsNone(self.stored("google_country"))
+        C.cmd_nodes()
+        self.assertNotIn("evil.example", self.sent[-1])
+
+    def test_heartbeat_with_bad_timestamp_does_not_fail(self):
+        for bad in ("abc", [1], {"a": 1}, -5, self.clock[0] + 10**9):
+            status, _ = self.heartbeat(last_restart=bad)
+            self.assertEqual(status, 200, bad)
+            self.assertEqual(self.stored("last_restart"), 0, bad)
+
+    def test_result_meta_is_whitelisted(self):
+        self.queue_restart()
+        (cmd,) = self.deliver()
+        status, _ = self.call(
+            "POST",
+            "/result",
+            {
+                "id": cmd["id"],
+                "ok": True,
+                "output": "",
+                "meta": {
+                    "warp_up": True,
+                    "country": self.EVIL,
+                    "cloudflare_loc": self.EVIL,
+                    "exit_ip": self.EVIL,
+                    "surprise": self.EVIL,
+                },
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(self.sent)
+        for message in self.sent:
+            self.assertNotIn("evil.example", message)
+        self.assertIsNone(self.stored("google_country"))
+
+    def test_non_dict_meta_and_non_integer_id_do_not_fail(self):
+        for body in (
+            {"id": 1, "ok": True, "meta": "oops"},
+            {"id": 1, "ok": True, "meta": [1, 2]},
+            {"id": "1; DROP TABLE nodes", "ok": True, "meta": {}},
+            {"id": [1], "ok": True},
+        ):
+            status, _ = self.call("POST", "/result", body)
+            self.assertEqual(status, 200, body)
+        self.assertEqual(len(self.sql("SELECT name FROM nodes")), 1)
+
+    def test_notify_meta_is_whitelisted(self):
+        status, _ = self.call(
+            "POST",
+            "/notify",
+            {"reason": "auto", "meta": {"warp_up": True, "country": self.EVIL}},
+        )
+        self.assertEqual(status, 200)
+        self.assertNotIn("evil.example", " ".join(self.sent))
+
+    def test_values_already_in_the_database_are_escaped_on_output(self):
+        self.sql(
+            "UPDATE nodes SET last_heartbeat = ?, warp_alive = 1, "
+            "google_country = ? WHERE name = ?",
+            self.clock[0],
+            "<i>x",
+            self.NODE,
+        )
+        self.sql(
+            "INSERT INTO nodes (name, token, registered_at, last_heartbeat, warp_alive) "
+            "VALUES ('<b>legacy', 'tok', 0, 0, 0)"
+        )
+        C.cmd_nodes()
+        self.assertNotIn("<b>legacy", self.sent[-1])
+        self.assertNotIn("<i>x", self.sent[-1])
+        self.assertIn("&lt;b&gt;legacy", self.sent[-1])
+        C.cmd_status(self.NODE)
+        self.assertNotIn("<i>x", self.sent[-1])
+
+    def test_add_node_rejects_names_the_bot_cannot_address(self):
+        for bad in ("", "has space", "<b>", "a/b", "x" * 65, "caf\u00e9"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    C.cli_add_node(bad)
+        with contextlib.redirect_stdout(io.StringIO()):
+            C.cli_add_node("fra-1.node_2")
+        self.assertEqual(len(self.sql("SELECT name FROM nodes")), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

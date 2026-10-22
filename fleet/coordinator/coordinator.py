@@ -24,6 +24,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import secrets
 import signal
 import sqlite3
@@ -295,6 +296,52 @@ def esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+# ---------------------------------------------------------------------------
+# Validation of data reported by nodes (untrusted: any holder of a node token)
+# ---------------------------------------------------------------------------
+
+# Same alphabet as NODE_NAME in single/bin/warp-bot.sh.
+NODE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+_COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
+_IP_RE = re.compile(r"^[0-9A-Fa-f:.]{1,45}$")
+
+
+def clean_country(value):
+    """Upper-case two-letter country code, or '' for anything else."""
+    if not isinstance(value, str):
+        return ""
+    value = value.strip().upper()
+    return value if _COUNTRY_RE.match(value) else ""
+
+
+def clean_ts(value):
+    """Unix timestamp between 0 and now; anything else becomes 0."""
+    try:
+        ts = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return ts if 0 <= ts <= now() else 0
+
+
+def clean_meta(raw):
+    """Whitelist the restart report a node sends.
+
+    Only the keys the agent produces survive, each with a validated type, so
+    a node cannot store arbitrary text or markup that is later rendered into
+    the operator's Telegram chat.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    ip = raw.get("exit_ip")
+    return {
+        "warp_up": raw.get("warp_up") is True,
+        "still_ru": raw.get("still_ru") is True,
+        "country": clean_country(raw.get("country")),
+        "cloudflare_loc": clean_country(raw.get("cloudflare_loc")),
+        "exit_ip": ip if isinstance(ip, str) and _IP_RE.match(ip) else "",
+    }
+
+
 def _format_restart_message(name, meta, kind):
     """Build the Telegram card for a restart event.
 
@@ -437,7 +484,7 @@ def cmd_nodes():
             detail = f"RU · restart {fmt_dur(rest)} ago" if rest else "RU"
         else:
             icon, detail = "🟢", (r["google_country"] or "?")
-        lines.append(f"{icon} <code>{name}</code>  {detail}")
+        lines.append(f"{icon} <code>{esc(name)}</code>  {esc(detail)}")
     tg_send("\n".join(lines))
 
 
@@ -457,7 +504,7 @@ def cmd_status(name):
         f"<b>{esc(name)}</b>",
         f"heartbeat: {fmt_dur(age)} ago",
         f"warp_alive: {'yes' if r['warp_alive'] else 'no'}",
-        f"google: {r['google_country'] or '?'}",
+        f"google: {esc(r['google_country'] or '?')}",
         f"last restart: {fmt_dur(rest)} ago" if rest else "last restart: never",
     ]
     tg_send("\n".join(lines))
@@ -826,9 +873,9 @@ class Handler(BaseHTTPRequestHandler):
                 "warp_alive = ?, last_restart = ? WHERE name = ?",
                 (
                     now(),
-                    b.get("google_country") or None,
-                    1 if b.get("warp_alive") else 0,
-                    int(b.get("last_restart") or 0),
+                    clean_country(b.get("google_country")) or None,
+                    1 if b.get("warp_alive") is True else 0,
+                    clean_ts(b.get("last_restart")),
                     name,
                 ),
             )
@@ -877,9 +924,12 @@ class Handler(BaseHTTPRequestHandler):
 
         b = self.read_json()
         cid = b.get("id")
-        ok = bool(b.get("ok"))
+        ok = b.get("ok") is True
         out = str(b.get("output", ""))[:4000]
-        meta = b.get("meta") or {}
+        meta = clean_meta(b.get("meta"))
+        if type(cid) is not int:
+            self.reply(200, {"ok": True, "ignored": True})
+            return
 
         # Record the result exactly once. The agent re-sends a result when the
         # response was lost, so a repeat must not notify, update the node or
@@ -928,12 +978,13 @@ class Handler(BaseHTTPRequestHandler):
 
         b = self.read_json()
         text = str(b.get("text", ""))
-        meta = b.get("meta") or {}
+        raw_meta = b.get("meta")
+        meta = clean_meta(raw_meta)
         reason = str(b.get("reason", ""))
 
         _apply_meta_to_node(name, meta)
 
-        if reason == "auto" and meta:
+        if reason == "auto" and isinstance(raw_meta, dict) and raw_meta:
             tg_send(_format_restart_message(name, meta, "auto-restart"))
         elif text:
             tg_send(f"[<code>{esc(name)}</code>] {esc(text)}")
@@ -947,6 +998,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def cli_add_node(name):
+    if not NODE_NAME_RE.match(name):
+        raise ValueError("node name must match [A-Za-z0-9._-]{1,64}")
     token = secrets.token_urlsafe(32)
     conn = db_connect()
     try:
@@ -1060,7 +1113,11 @@ def main():
         run_server()
     elif cmd == "add-node" and len(sys.argv) == 3:
         db_init()
-        cli_add_node(sys.argv[2])
+        try:
+            cli_add_node(sys.argv[2])
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return 2
     elif cmd == "remove-node" and len(sys.argv) == 3:
         db_init()
         cli_remove_node(sys.argv[2])
