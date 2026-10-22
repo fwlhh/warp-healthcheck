@@ -54,6 +54,10 @@ HTTP_HOST = env("HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(env("HTTP_PORT", "8080"))
 DB_PATH = Path(env("DB_PATH", "/var/lib/warp-coordinator/coordinator.db"))
 STALE_AFTER = int(env("STALE_AFTER", "180"))
+# Proactive alerts when a node goes silent / loses WARP, and when it recovers.
+NODE_ALERTS = env("NODE_ALERTS", "1").lower() not in ("0", "false", "no", "off", "")
+WARP_DOWN_ALERT_AFTER = int(env("WARP_DOWN_ALERT_AFTER", "120"))
+MONITOR_INTERVAL = int(env("MONITOR_INTERVAL", "30"))
 COMMAND_LEASE = int(env("COMMAND_LEASE", "120"))
 COMMAND_MAX_ATTEMPTS = int(env("COMMAND_MAX_ATTEMPTS", "3"))
 RETRY_UNKNOWN_LIMIT = int(env("RETRY_UNKNOWN_LIMIT", "2"))
@@ -263,8 +267,10 @@ def tg_call(method, http_timeout=40, **params):
 
 
 def tg_send(text):
+    """Send an HTML message to the operator. Returns True once Telegram
+    accepted it; callers that must not lose a message check the result."""
     try:
-        tg_call(
+        resp = tg_call(
             "sendMessage",
             http_timeout=20,
             chat_id=TG_CHAT_ID,
@@ -272,12 +278,14 @@ def tg_send(text):
             parse_mode="HTML",
             disable_web_page_preview="true",
         )
+        return bool(resp and resp.get("ok"))
     except TelegramAuthError as e:
         log("ERROR", f"sendMessage: {e}")
     except TelegramTransportError as e:
         log("WARN", f"sendMessage: {e}")
     except TelegramConflictError:
         log("WARN", "sendMessage: 409 conflict")
+    return False
 
 
 # ===========================================================================
@@ -759,6 +767,97 @@ def bot_loop():
 
 
 # ===========================================================================
+# Node monitor: tell the operator when a node goes silent or loses WARP
+# ===========================================================================
+
+# In-memory debounce: name -> (state, first seen in this state).
+_node_seen = {}
+_monitor_started = None
+
+
+def _node_alert_text(name, row, state, told, t):
+    n = f"<code>{esc(name)}</code>"
+    if state == "stale":
+        age = fmt_dur(t - row["last_heartbeat"])
+        return (
+            f"⚫ {n} stopped reporting (last heartbeat {age} ago). "
+            "The node, its agent or its network is down."
+        )
+    if state == "warp_down":
+        extra = " The node is reporting again." if told == "stale" else ""
+        return f"🔴 {n}: the WARP proxy is down on the node.{extra}"
+    if told == "stale":
+        return f"🟢 {n} is reporting again."
+    return f"🟢 {n}: the WARP proxy is back."
+
+
+def node_monitor_tick(t=None):
+    """One pass over all nodes. Sends one message per state change the
+    operator has not been told about yet and returns how many were sent.
+
+    * The state the operator was last told about is persisted (meta
+      node_alert:<name>), so a repeat is never sent, including after a
+      coordinator restart.
+    * It is only updated after Telegram accepted the message, so an alert
+      that could not be delivered is retried on the next pass.
+    * Silence is not judged until STALE_AFTER seconds after start: nodes need
+      that long to heartbeat again after a coordinator restart.
+    * WARP-down must persist for WARP_DOWN_ALERT_AFTER seconds, so the short
+      outage of an ordinary restart does not page anyone.
+    """
+    global _monitor_started
+    t = now() if t is None else t
+    if _monitor_started is None:
+        _monitor_started = t
+
+    conn = db_connect()
+    try:
+        rows = conn.execute("SELECT * FROM nodes").fetchall()
+    finally:
+        conn.close()
+
+    sent = 0
+    for r in rows:
+        name = r["name"]
+        state = node_state(r, t)
+        if state == "never":
+            continue
+        if state == "stale" and t - _monitor_started < STALE_AFTER:
+            continue
+        seen = _node_seen.get(name)
+        if seen is None or seen[0] != state:
+            seen = _node_seen[name] = (state, t)
+        delay = WARP_DOWN_ALERT_AFTER if state == "warp_down" else 0
+        if t - seen[1] < delay:
+            continue
+        key = f"node_alert:{name}"
+        told = meta_get(key, "ok")
+        if told == state:
+            continue
+        if tg_send(_node_alert_text(name, r, state, told, t)):
+            meta_set(key, state)
+            sent += 1
+            log("WARN", f"alert sent: {name} {told} -> {state}")
+        else:
+            log("WARN", f"alert for {name} ({state}) not delivered; will retry")
+
+    known = {r["name"] for r in rows}
+    for name in [n for n in _node_seen if n not in known]:
+        del _node_seen[name]
+    return sent
+
+
+def node_monitor():
+    log("INFO", "node_monitor started")
+    while True:
+        time.sleep(MONITOR_INTERVAL)
+        try:
+            node_monitor_tick()
+        except Exception as e:
+            log("ERROR", f"node_monitor: {type(e).__name__}: {e}")
+
+
+# ===========================================================================
 # Command requeue watchdog
 # ===========================================================================
 
@@ -907,12 +1006,15 @@ class Handler(BaseHTTPRequestHandler):
             s = dict(_state)
         conn = db_connect()
         try:
-            nodes = conn.execute("SELECT COUNT(*) AS c FROM nodes").fetchone()["c"]
+            node_rows = conn.execute("SELECT * FROM nodes").fetchall()
             pending = conn.execute(
                 "SELECT COUNT(*) AS c FROM commands WHERE result_at IS NULL"
             ).fetchone()["c"]
         finally:
             conn.close()
+        t = now()
+        states = [node_state(r, t) for r in node_rows]
+        nodes = len(node_rows)
         self.reply(
             200,
             {
@@ -921,6 +1023,8 @@ class Handler(BaseHTTPRequestHandler):
                 "last_poll_age": now() - s.get("last_poll_ts", 0),
                 "offset": s.get("offset", 0),
                 "nodes": nodes,
+                "nodes_stale": states.count("stale"),
+                "nodes_warp_down": states.count("warp_down"),
                 "commands_pending": pending,
                 "retry_unknown_limit": RETRY_UNKNOWN_LIMIT,
             },
@@ -1085,7 +1189,8 @@ def cli_remove_node(name):
     try:
         conn.execute("DELETE FROM nodes WHERE name = ?", (name,))
         conn.execute("DELETE FROM commands WHERE node = ?", (name,))
-        conn.execute("DELETE FROM meta WHERE key = ?", (f"retry_unknown:{name}",))
+        for prefix in ("retry_unknown", "node_alert"):
+            conn.execute("DELETE FROM meta WHERE key = ?", (f"{prefix}:{name}",))
     finally:
         conn.close()
     print(f"Removed {name}")
@@ -1163,6 +1268,8 @@ def run_server():
 
     threading.Thread(target=bot_loop, daemon=True).start()
     threading.Thread(target=requeue_watchdog, daemon=True).start()
+    if NODE_ALERTS:
+        threading.Thread(target=node_monitor, daemon=True).start()
 
     if HTTP_HOST in ("0.0.0.0", "::"):
         log(

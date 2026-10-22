@@ -32,6 +32,9 @@
 | `STALE_AFTER` | no       | `180`                                    | Node considered stale after N seconds |
 | `RETRY_UNKNOWN_LIMIT` | no | `2`                                  | Extra restarts after one ends with unknown Google country; `0` disables |
 | `RETRY_UNKNOWN_DELAY` | no | `330`                                | Seconds before such a retry is delivered; keep above the agents' `RESTART_COOLDOWN` |
+| `NODE_ALERTS` | no | `1` | Message when a node stops reporting or loses WARP, and when it recovers; `0` disables |
+| `WARP_DOWN_ALERT_AFTER` | no | `120` | Seconds WARP must stay down before alerting (ordinary restarts do not page) |
+| `MONITOR_INTERVAL` | no | `30` | Seconds between monitor passes |
 
 ## Fleet — `/etc/warp-agent.env`
 

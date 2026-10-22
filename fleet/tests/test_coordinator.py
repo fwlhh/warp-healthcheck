@@ -53,13 +53,21 @@ class CoordinatorTestCase(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.clock = [1_000_000]
         self.sent = []
+        self.tg_ok = True  # set False to simulate Telegram being unreachable
+
+        def fake_tg_send(text):
+            if not self.tg_ok:
+                return False
+            self.sent.append(text)
+            return True
+
         self.db_path = Path(tmp.name) / "state" / "coordinator.db"
 
         for name, new in {
             "DB_PATH": self.db_path,
             "TG_CHAT_ID": 1,
             "now": lambda: self.clock[0],
-            "tg_send": lambda text: self.sent.append(text),
+            "tg_send": fake_tg_send,
         }.items():
             patcher = mock.patch.object(C, name, new)
             patcher.start()
@@ -509,6 +517,118 @@ class StaleNodeDisplayTest(CoordinatorTestCase):
         self.assertIn("NEVER", self.list_nodes())
         C.cmd_nodes()
         self.assertIn("never connected", self.sent[-1])
+
+
+class NodeAlertsTest(CoordinatorTestCase):
+    """Nobody used to be told when a node went silent: STALE_AFTER only
+    changed how /nodes drew the row, and a node could be gone for 18 days
+    without a single message."""
+
+    def setUp(self):
+        super().setUp()
+        for name, value in {"_node_seen": {}, "_monitor_started": None}.items():
+            patcher = mock.patch.object(C, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def beat(self, warp_alive=True):
+        self.call("POST", "/heartbeat", {"warp_alive": warp_alive, "google_country": "DE"})
+
+    def tick(self, advance=0):
+        self.clock[0] += advance
+        return C.node_monitor_tick()
+
+    def test_silent_node_is_reported_once(self):
+        self.beat()
+        self.assertEqual(self.tick(), 0)
+        self.assertEqual(self.tick(C.STALE_AFTER + 1), 1)
+        self.assertIn("stopped reporting", self.sent[-1])
+        for _ in range(50):  # for the next 18 days: no repeats
+            self.assertEqual(self.tick(30 * 86400 // 50), 0)
+        self.assertEqual(len(self.sent), 1)
+
+    def test_recovery_is_reported(self):
+        self.beat()
+        self.tick()
+        self.tick(C.STALE_AFTER + 1)
+        self.beat()
+        self.assertEqual(self.tick(), 1)
+        self.assertIn("reporting again", self.sent[-1])
+        self.assertEqual(self.tick(30), 0)
+
+    def test_no_verdict_on_silence_right_after_coordinator_start(self):
+        self.beat()
+        self.clock[0] += 5 * 86400  # the coordinator was down for days
+        self.assertEqual(self.tick(), 0, "judged silence before nodes could report")
+        self.assertEqual(self.tick(C.STALE_AFTER // 2), 0)
+        self.assertEqual(self.tick(C.STALE_AFTER), 1)
+
+    def test_warp_down_is_reported_only_if_it_persists(self):
+        self.beat()
+        self.tick()
+        self.beat(warp_alive=False)
+        self.assertEqual(self.tick(), 0)
+        self.clock[0] += C.WARP_DOWN_ALERT_AFTER - 1
+        self.beat(warp_alive=False)
+        self.assertEqual(self.tick(), 0)
+        self.clock[0] += 1
+        self.beat(warp_alive=False)
+        self.assertEqual(self.tick(), 1)
+        self.assertIn("WARP proxy is down", self.sent[-1])
+        self.beat(warp_alive=True)
+        self.assertEqual(self.tick(), 1)
+        self.assertIn("WARP proxy is back", self.sent[-1])
+
+    def test_short_warp_outage_does_not_alert(self):
+        self.beat()
+        self.tick()
+        self.beat(warp_alive=False)
+        self.tick()
+        self.beat(warp_alive=True)
+        self.assertEqual(self.tick(30), 0)
+        self.assertEqual(self.sent, [])
+
+    def test_undelivered_alert_is_retried_until_it_goes_through(self):
+        self.beat()
+        self.tick()
+        self.tg_ok = False
+        self.assertEqual(self.tick(C.STALE_AFTER + 1), 0)
+        self.assertEqual(self.tick(30), 0)
+        self.assertEqual(C.meta_get(f"node_alert:{self.NODE}", "ok"), "ok")
+        self.tg_ok = True
+        self.assertEqual(self.tick(30), 1)
+        self.assertEqual(self.tick(30), 0)
+
+    def test_state_survives_a_coordinator_restart(self):
+        self.beat()
+        self.tick()
+        self.tick(C.STALE_AFTER + 1)
+        self.assertEqual(len(self.sent), 1)
+        C._node_seen.clear()
+        C._monitor_started = None  # what a fresh process looks like
+        self.tick()
+        self.tick(C.STALE_AFTER + 1)
+        self.assertEqual(len(self.sent), 1, "re-alerted after restart")
+
+    def test_node_that_never_connected_is_not_an_outage(self):
+        self.tick()
+        self.assertEqual(self.tick(10 * 86400), 0)
+
+    def test_remove_node_forgets_alert_state(self):
+        self.beat()
+        self.tick()
+        self.tick(C.STALE_AFTER + 1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            C.cli_remove_node(self.NODE)
+        self.assertEqual(C.meta_get(f"node_alert:{self.NODE}", "gone"), "gone")
+
+    def test_health_endpoint_counts_problem_nodes(self):
+        self.beat(warp_alive=False)
+        status, body = self.call("GET", "/health", headers={})
+        self.assertEqual((status, body["nodes_warp_down"], body["nodes_stale"]), (200, 1, 0))
+        self.clock[0] += C.STALE_AFTER + 1
+        _, body = self.call("GET", "/health", headers={})
+        self.assertEqual((body["nodes_warp_down"], body["nodes_stale"]), (0, 1))
 
 
 if __name__ == "__main__":
