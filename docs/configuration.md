@@ -29,6 +29,8 @@
 | `HTTP_PORT`   | no       | `8080`                                   | Bind port                            |
 | `DB_PATH`     | no       | `/var/lib/warp-coordinator/coordinator.db` | SQLite path                        |
 | `STALE_AFTER` | no       | `180`                                    | Node considered stale after N seconds |
+| `RETRY_UNKNOWN_LIMIT` | no | `2`                                  | Extra restarts after one ends with unknown Google country; `0` disables |
+| `RETRY_UNKNOWN_DELAY` | no | `330`                                | Seconds before such a retry is delivered; keep above the agents' `RESTART_COOLDOWN` |
 
 ## Fleet — `/etc/warp-agent.env`
 

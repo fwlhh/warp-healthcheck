@@ -13,8 +13,11 @@ Design notes:
   * After every restart the coordinator updates the node's stored
     google_country immediately, instead of waiting for the next
     heartbeat.
-  * If a restart ends with an unknown country, the coordinator queues
-    another restart automatically, up to RETRY_UNKNOWN_LIMIT times.
+  * If a restart ends with an unknown country, the coordinator can queue
+    another restart, at most RETRY_UNKNOWN_LIMIT times (0 disables it),
+    each one delayed by RETRY_UNKNOWN_DELAY seconds so it respects the
+    agent's RESTART_COOLDOWN. An unknown country usually means the probe
+    failed, which a restart does not fix, so the default is conservative.
 """
 
 import contextlib
@@ -52,7 +55,8 @@ DB_PATH = Path(env("DB_PATH", "/var/lib/warp-coordinator/coordinator.db"))
 STALE_AFTER = int(env("STALE_AFTER", "180"))
 COMMAND_LEASE = int(env("COMMAND_LEASE", "120"))
 COMMAND_MAX_ATTEMPTS = int(env("COMMAND_MAX_ATTEMPTS", "3"))
-RETRY_UNKNOWN_LIMIT = int(env("RETRY_UNKNOWN_LIMIT", "10"))
+RETRY_UNKNOWN_LIMIT = int(env("RETRY_UNKNOWN_LIMIT", "2"))
+RETRY_UNKNOWN_DELAY = int(env("RETRY_UNKNOWN_DELAY", "330"))
 POLL_TIMEOUT = int(env("POLL_TIMEOUT", "25"))
 LOG_LEVEL = env("LOG_LEVEL", "INFO").upper()
 
@@ -124,6 +128,7 @@ def _migrate_commands(conn):
         ("ok", "INTEGER"),
         ("output", "TEXT"),
         ("result_at", "INTEGER"),
+        ("not_before", "INTEGER NOT NULL DEFAULT 0"),
     ]
     for name, typ in additions:
         if name not in cols:
@@ -169,7 +174,8 @@ def db_init() -> None:
                 attempts     INTEGER NOT NULL DEFAULT 0,
                 ok           INTEGER,
                 output       TEXT,
-                result_at    INTEGER
+                result_at    INTEGER,
+                not_before   INTEGER NOT NULL DEFAULT 0
             );
             CREATE INDEX IF NOT EXISTS idx_commands_pending
                 ON commands(node, result_at, delivered_at);
@@ -342,10 +348,19 @@ def _apply_meta_to_node(name, meta):
 
 
 def _schedule_unknown_retry(name):
-    """Queue another restart if the last one ended with country == '?'."""
+    """Queue a delayed restart if the last one ended with country == '?'."""
+    if RETRY_UNKNOWN_LIMIT <= 0:
+        return
     key = f"retry_unknown:{name}"
     conn = db_connect()
     try:
+        pending = conn.execute(
+            "SELECT id FROM commands WHERE node = ? AND command = 'restart' "
+            "AND result_at IS NULL LIMIT 1",
+            (name,),
+        ).fetchone()
+        if pending:
+            return
         row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         count = int(row["value"]) if row else 0
 
@@ -364,17 +379,18 @@ def _schedule_unknown_retry(name):
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, str(count)),
         )
+        t = now()
         conn.execute(
-            "INSERT INTO commands (node, command, created_at) "
-            "VALUES (?, 'restart', ?)",
-            (name, now()),
+            "INSERT INTO commands (node, command, created_at, not_before) "
+            "VALUES (?, 'restart', ?, ?)",
+            (name, t, t + RETRY_UNKNOWN_DELAY),
         )
     finally:
         conn.close()
-    log("INFO", f"{name}: queued retry #{count} (country still unknown)")
+    log("INFO", f"{name}: queued retry #{count} in {RETRY_UNKNOWN_DELAY}s")
     tg_send(
         f"🔁 <code>{esc(name)}</code>: country still unknown, "
-        f"queued retry #{count}/{RETRY_UNKNOWN_LIMIT}"
+        f"retry #{count}/{RETRY_UNKNOWN_LIMIT} in {fmt_dur(RETRY_UNKNOWN_DELAY)}"
     )
 
 
@@ -829,10 +845,11 @@ class Handler(BaseHTTPRequestHandler):
             rows = conn.execute(
                 "SELECT id, command FROM commands "
                 "WHERE node = ? AND result_at IS NULL "
+                "  AND not_before <= ? "
                 "  AND (delivered_at IS NULL OR delivered_at < ?) "
                 "  AND attempts < ? "
                 "ORDER BY id LIMIT 5",
-                (name, cutoff, COMMAND_MAX_ATTEMPTS),
+                (name, t, cutoff, COMMAND_MAX_ATTEMPTS),
             ).fetchall()
             if rows:
                 ids = [r["id"] for r in rows]
