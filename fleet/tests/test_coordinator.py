@@ -218,5 +218,76 @@ class UnknownCountryRetryTest(CoordinatorTestCase):
         self.assertEqual(self.pending_restarts(), [])
 
 
+class ResultIdempotencyTest(CoordinatorTestCase):
+    """The agent re-sends a result when the response was lost. The second
+    copy used to send another Telegram card and schedule another retry."""
+
+    def setUp(self):
+        super().setUp()
+        for name, value in {"RETRY_UNKNOWN_LIMIT": 5, "RETRY_UNKNOWN_DELAY": 330}.items():
+            patcher = mock.patch.object(C, name, value, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def open_command(self):
+        self.queue_restart()
+        (cmd,) = self.deliver()
+        return cmd["id"]
+
+    def test_first_result_is_recorded_and_announced(self):
+        cid = self.open_command()
+        status, _ = self.post_result(cid, country="DE")
+        self.assertEqual(status, 200)
+        (row,) = self.sql("SELECT ok, result_at FROM commands WHERE id = ?", cid)
+        self.assertEqual(row["ok"], 1)
+        self.assertIsNotNone(row["result_at"])
+        self.assertEqual(len(self.sent), 1)
+
+    def test_repeated_result_has_no_side_effects(self):
+        cid = self.open_command()
+        self.post_result(cid, country="")  # unknown -> schedules one retry
+        sent_after_first = len(self.sent)
+        self.assertEqual(len(self.pending_restarts()), 1)
+
+        status, body = self.post_result(cid, country="")  # resend
+        self.assertEqual(len(self.sent), sent_after_first, "duplicate notification")
+        self.assertEqual(len(self.pending_restarts()), 1, "duplicate retry queued")
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ignored"))
+
+    def test_result_for_another_nodes_command_is_ignored(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            C.cli_add_node("n2")
+        self.sql(
+            "INSERT INTO commands (node, command, created_at) VALUES ('n2', 'restart', ?)",
+            self.clock[0],
+        )
+        (other,) = self.sql("SELECT id FROM commands WHERE node = 'n2'")
+        status, body = self.post_result(other["id"], country="DE")
+        self.assertEqual(self.sent, [], "notified about a foreign command")
+        (row,) = self.sql("SELECT result_at FROM commands WHERE id = ?", other["id"])
+        self.assertIsNone(row["result_at"])
+        self.assertEqual(status, 200)
+        self.assertTrue(body.get("ignored"))
+
+    def test_late_result_replaces_a_watchdog_timeout_once(self):
+        cid = self.open_command()
+        self.sql(
+            "UPDATE commands SET ok = 0, output = ?, result_at = ? WHERE id = ?",
+            C.LEASE_EXPIRED_OUTPUT,
+            self.clock[0],
+            cid,
+        )
+        self.post_result(cid, country="DE")
+        (row,) = self.sql("SELECT ok, output FROM commands WHERE id = ?", cid)
+        self.assertEqual(row["ok"], 1)
+        self.assertNotEqual(row["output"], C.LEASE_EXPIRED_OUTPUT)
+        self.assertEqual(len(self.sent), 1)
+
+        self.post_result(cid, country="DE")  # and now it is closed for good
+        self.assertEqual(len(self.sent), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
