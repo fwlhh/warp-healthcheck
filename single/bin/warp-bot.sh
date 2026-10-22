@@ -38,6 +38,7 @@ readonly CURL_TIMEOUT="${CURL_TIMEOUT:-10}"
 readonly WARP_BOOT_TIMEOUT="${WARP_BOOT_TIMEOUT:-45}"
 
 readonly STATE_DIR="${STATE_DIR:-/var/lib/warp-bot}"
+readonly TG_API_BASE="${TG_API_BASE:-https://api.telegram.org}"
 readonly STATE_FILE="${STATE_DIR}/last-restart"
 readonly OFFSET_FILE="${STATE_DIR}/offset"
 
@@ -103,11 +104,17 @@ init_state() {
 # Telegram API
 # ---------------------------------------------------------------------------
 
+# The bot token is part of the URL. Passing it as a curl argument would expose
+# it to every local user in `ps` and /proc/<pid>/cmdline, so the URL goes
+# through a curl config file (process substitution) instead; only a
+# /dev/fd/N path appears in the argument list.
 tg_api() {
-  local method="$1"
+  local method="$1" token
   shift
+  token="${TG_TOKEN//\\/\\\\}"
+  token="${token//\"/\\\"}"
   curl -fsS --max-time 30 \
-    "https://api.telegram.org/bot${TG_TOKEN}/${method}" \
+    -K <(printf 'url = "%s/bot%s/%s"\n' "${TG_API_BASE}" "${token}" "${method}") \
     "$@" 2>/dev/null || true
 }
 
