@@ -39,6 +39,7 @@ readonly WARP_BOOT_TIMEOUT="${WARP_BOOT_TIMEOUT:-45}"
 
 readonly STATE_DIR="${STATE_DIR:-/var/lib/warp-bot}"
 readonly TG_API_BASE="${TG_API_BASE:-https://api.telegram.org}"
+readonly ALERT_DIR="${STATE_DIR}/alerts"
 readonly STATE_FILE="${STATE_DIR}/last-restart"
 readonly OFFSET_FILE="${STATE_DIR}/offset"
 
@@ -125,6 +126,48 @@ tg_send() {
     --data-urlencode "text=[<code>${NODE_NAME}</code>] ${text}" \
     -d 'parse_mode=HTML' \
     -d 'disable_web_page_preview=true' >/dev/null
+}
+
+# Like tg_send, but succeeds only if Telegram accepted the message. Use it in
+# `if`: it returns non-zero on failure, which `set -e` would otherwise treat
+# as fatal.
+tg_send_ok() {
+  local reply
+  reply=$(tg_api sendMessage \
+    -d "chat_id=${TG_CHAT_ID}" \
+    --data-urlencode "text=[<code>${NODE_NAME}</code>] $1" \
+    -d 'parse_mode=HTML' \
+    -d 'disable_web_page_preview=true')
+  [[ "${reply}" == *'"ok":true'* ]]
+}
+
+# alert_raise KEY MESSAGE: tell the operator once per outage. The marker is
+# written only after Telegram accepted the message, so an alert that could not
+# be sent is retried on the next check instead of being lost; being on disk,
+# it also survives a restart of the bot.
+alert_raise() {
+  local key="$1" message="$2"
+  if [[ -e "${ALERT_DIR}/${key}" ]]; then
+    return 0
+  fi
+  if tg_send_ok "${message}"; then
+    mkdir -p "${ALERT_DIR}"
+    : >"${ALERT_DIR}/${key}"
+  fi
+  return 0
+}
+
+# alert_clear KEY MESSAGE: report the recovery, but only if an alert for KEY
+# was raised before.
+alert_clear() {
+  local key="$1" message="$2"
+  if [[ ! -e "${ALERT_DIR}/${key}" ]]; then
+    return 0
+  fi
+  if tg_send_ok "${message}"; then
+    rm -f "${ALERT_DIR}/${key}"
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -312,15 +355,18 @@ scheduled_check() {
 
   if ! warp_alive; then
     log 'WARP proxy unreachable'
+    alert_raise warp_down '🔴 WARP proxy is unreachable'
     return 0
   fi
+  alert_clear warp_down '🟢 WARP proxy is reachable again'
 
   country=$(detect_google_country)
   if [[ -z "${country}" ]]; then
     log 'failed to detect Google country'
-    tg_send '⚠️ Could not detect Google country through WARP'
+    alert_raise detect_failed '⚠️ Could not detect Google country through WARP'
     return 0
   fi
+  alert_clear detect_failed '🟢 Google country detection works again'
 
   log "check: Google=${country}"
 
