@@ -631,5 +631,99 @@ class NodeAlertsTest(CoordinatorTestCase):
         self.assertEqual((body["nodes_warp_down"], body["nodes_stale"]), (0, 1))
 
 
+class CommandExpiryTest(CoordinatorTestCase):
+    """A command queued for a node that never answers used to stay pending
+    forever: /restart said "already pending", and the node ran the old
+    command whenever it came back."""
+
+    def beat(self):
+        self.call("POST", "/heartbeat", {"warp_alive": True, "google_country": "DE"})
+
+    def command_row(self, cid):
+        return self.sql("SELECT * FROM commands WHERE id = ?", cid)[0]
+
+    def test_command_the_node_never_fetched_expires(self):
+        self.queue_restart()
+        self.clock[0] += C.COMMAND_TTL - 1
+        self.assertEqual(C.expire_commands(), [])
+        self.clock[0] += 2
+        self.assertEqual(C.expire_commands(), [(1, self.NODE)])
+        row = self.command_row(1)
+        self.assertEqual(row["ok"], 0)
+        self.assertIn("expired", row["output"])
+        self.assertEqual(C.expire_commands(), [], "expired twice")
+
+    def test_expired_command_is_not_delivered_even_before_the_watchdog_runs(self):
+        self.queue_restart()
+        self.clock[0] += C.COMMAND_TTL + 1
+        self.assertEqual(self.deliver(), [])
+
+    def test_fresh_command_is_delivered(self):
+        self.queue_restart()
+        self.clock[0] += C.COMMAND_TTL - 5
+        self.assertEqual(len(self.deliver()), 1)
+
+    def test_command_in_flight_is_not_expired(self):
+        self.queue_restart()
+        self.assertEqual(len(self.deliver()), 1)  # delivered, result pending
+        self.clock[0] += C.COMMAND_TTL + 1
+        self.assertEqual(C.expire_commands(), [])
+
+    def test_delayed_retry_is_not_expired_before_it_is_due(self):
+        due = self.clock[0] + 330
+        self.sql(
+            "INSERT INTO commands (node, command, created_at, not_before) "
+            "VALUES (?, 'restart', ?, ?)",
+            self.NODE, self.clock[0], due,
+        )
+        self.clock[0] = due + 60
+        self.assertEqual(C.expire_commands(), [])
+        self.assertEqual(len(self.deliver()), 1)
+
+    def test_restart_is_not_blocked_by_an_expired_command(self):
+        self.beat()
+        C.cmd_restart(self.NODE)
+        self.assertIn("Queued", self.sent[-1])
+        self.clock[0] += 18 * 86400
+        C.cmd_restart(self.NODE)
+        self.assertIn("Queued", self.sent[-1])
+        self.assertNotIn("already pending", self.sent[-1])
+
+    def test_restart_of_a_silent_node_warns(self):
+        self.beat()
+        self.clock[0] += C.STALE_AFTER + 1
+        C.cmd_restart(self.NODE)
+        self.assertIn("not reporting", self.sent[-1])
+        self.assertIn("expires", self.sent[-1])
+
+    def test_restart_all_skips_silent_nodes_and_nodes_with_a_pending_restart(self):
+        for name in ("fresh", "busy", "silent"):
+            with contextlib.redirect_stdout(io.StringIO()):
+                C.cli_add_node(name)
+        self.sql("UPDATE nodes SET last_heartbeat = ?, warp_alive = 1 "
+                 "WHERE name IN ('fresh', 'busy', 'n1')", self.clock[0])
+        self.sql("UPDATE nodes SET last_heartbeat = ? WHERE name = 'silent'",
+                 self.clock[0] - 5 * 86400)
+        self.sql("INSERT INTO commands (node, command, created_at) "
+                 "VALUES ('busy', 'restart', ?)", self.clock[0])
+        C.cmd_restart_all()
+        queued = {r["node"] for r in self.sql(
+            "SELECT node FROM commands WHERE result_at IS NULL")}
+        self.assertEqual(queued, {"busy", "fresh", "n1"})
+        message = self.sent[-1]
+        self.assertIn("Queued restart for <b>2</b>", message)
+        self.assertIn("silent (not reporting)", message)
+        self.assertIn("busy (already pending)", message)
+
+    def test_old_finished_commands_are_pruned(self):
+        t = self.clock[0]
+        old, recent = 40 * 86400, 5 * 86400
+        for result_at in (t - old, t - recent, None):
+            self.sql("INSERT INTO commands (node, command, created_at, result_at) "
+                     "VALUES (?, 'restart', ?, ?)", self.NODE, t - old, result_at)
+        self.assertEqual(C.prune_commands(), 1)
+        self.assertEqual(len(self.sql("SELECT id FROM commands")), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

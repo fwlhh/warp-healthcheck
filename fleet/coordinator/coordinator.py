@@ -62,6 +62,11 @@ COMMAND_LEASE = int(env("COMMAND_LEASE", "120"))
 COMMAND_MAX_ATTEMPTS = int(env("COMMAND_MAX_ATTEMPTS", "3"))
 RETRY_UNKNOWN_LIMIT = int(env("RETRY_UNKNOWN_LIMIT", "2"))
 RETRY_UNKNOWN_DELAY = int(env("RETRY_UNKNOWN_DELAY", "330"))
+# A command nobody fetched within COMMAND_TTL is stale intent: drop it rather
+# than run it whenever the node next appears. Never shorter than a delayed
+# retry plus a delivery window.
+COMMAND_TTL = max(int(env("COMMAND_TTL", "600")), RETRY_UNKNOWN_DELAY + 120)
+COMMAND_RETENTION_DAYS = int(env("COMMAND_RETENTION_DAYS", "30"))
 POLL_TIMEOUT = int(env("POLL_TIMEOUT", "25"))
 # Output the watchdog stores when it gives up on a command. A real result
 # that arrives afterwards may still replace it once (see r_result).
@@ -555,6 +560,7 @@ def cmd_status(name):
 
 
 def cmd_restart(name):
+    expire_commands()  # an old command must not block a new one
     conn = db_connect()
     try:
         r = conn.execute("SELECT name FROM nodes WHERE name = ?", (name,)).fetchone()
@@ -574,30 +580,55 @@ def cmd_restart(name):
             (name, now()),
         )
         cid = cur.lastrowid
+        node = conn.execute("SELECT * FROM nodes WHERE name = ?", (name,)).fetchone()
     finally:
         conn.close()
     log("INFO", f"queued restart #{cid} for {name}")
-    tg_send(f"Queued restart for <code>{esc(name)}</code> (#{cid})")
+    text = f"Queued restart for <code>{esc(name)}</code> (#{cid})"
+    state = node_state(node, now())
+    if state in ("never", "stale"):
+        text += (
+            f"\n⚠️ The node is not reporting; the command expires in "
+            f"{fmt_dur(COMMAND_TTL)} if it is not picked up."
+        )
+    tg_send(text)
 
 
 def cmd_restart_all():
+    expire_commands()
     conn = db_connect()
     try:
-        rows = conn.execute("SELECT name FROM nodes").fetchall()
+        rows = conn.execute("SELECT * FROM nodes").fetchall()
         if not rows:
             tg_send("No nodes registered.")
             return
         t = now()
+        queued, skipped = 0, []
         for r in rows:
+            state = node_state(r, t)
+            if state in ("never", "stale"):
+                skipped.append(f"{r['name']} (not reporting)")
+                continue
+            pending = conn.execute(
+                "SELECT id FROM commands WHERE node = ? AND command = 'restart' "
+                "AND result_at IS NULL LIMIT 1",
+                (r["name"],),
+            ).fetchone()
+            if pending:
+                skipped.append(f"{r['name']} (already pending)")
+                continue
             conn.execute(
                 "INSERT INTO commands (node, command, created_at) VALUES (?, 'restart', ?)",
                 (r["name"], t),
             )
-        n = len(rows)
+            queued += 1
     finally:
         conn.close()
-    log("INFO", f"queued restart for {n} nodes")
-    tg_send(f"Queued restart for <b>{n}</b> nodes")
+    log("INFO", f"queued restart for {queued} nodes, skipped {len(skipped)}")
+    text = f"Queued restart for <b>{queued}</b> nodes"
+    if skipped:
+        text += "\nSkipped: " + ", ".join(f"<code>{esc(x)}</code>" for x in skipped)
+    tg_send(text)
 
 
 def cmd_logs(name):
@@ -862,6 +893,49 @@ def node_monitor():
 # ===========================================================================
 
 
+def expire_commands(t=None):
+    """Close commands that no node fetched within COMMAND_TTL.
+
+    Without this a restart queued for a dead node stays pending forever:
+    /restart answers "already pending", and the node runs the old command
+    whenever it next shows up. Returns [(id, node), ...].
+    """
+    t = now() if t is None else t
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, node FROM commands "
+            "WHERE result_at IS NULL AND delivered_at IS NULL "
+            "AND MAX(created_at, not_before) < ?",
+            (t - COMMAND_TTL,),
+        ).fetchall()
+        for r in rows:
+            conn.execute(
+                "UPDATE commands SET ok = 0, output = ?, result_at = ? WHERE id = ?",
+                (f"expired: not fetched by the node within {fmt_dur(COMMAND_TTL)}", t, r["id"]),
+            )
+    finally:
+        conn.close()
+    return [(r["id"], r["node"]) for r in rows]
+
+
+def prune_commands(t=None):
+    """Delete finished commands older than COMMAND_RETENTION_DAYS."""
+    t = now() if t is None else t
+    conn = db_connect()
+    try:
+        cur = conn.execute(
+            "DELETE FROM commands WHERE result_at IS NOT NULL AND result_at < ?",
+            (t - COMMAND_RETENTION_DAYS * 86400,),
+        )
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+_last_prune = 0
+
+
 def requeue_watchdog():
     """Return commands whose lease expired to the pending queue, and
     permanently fail commands that exceeded the attempt limit."""
@@ -889,6 +963,20 @@ def requeue_watchdog():
                 failed = cur.rowcount
             finally:
                 conn.close()
+
+            global _last_prune
+            expired = expire_commands(t)
+            if expired:
+                log("WARN", f"expired {len(expired)} undelivered command(s)")
+                tg_send(
+                    "⌛ Command(s) expired undelivered: "
+                    + ", ".join(f"<code>{esc(n)}</code> #{i}" for i, n in expired)
+                )
+            if t - _last_prune >= 3600:
+                _last_prune = t
+                pruned = prune_commands(t)
+                if pruned:
+                    log("INFO", f"pruned {pruned} old command(s)")
 
             if requeued:
                 log("WARN", f"requeued {requeued} stale command(s)")
@@ -1066,10 +1154,11 @@ class Handler(BaseHTTPRequestHandler):
                 "SELECT id, command FROM commands "
                 "WHERE node = ? AND result_at IS NULL "
                 "  AND not_before <= ? "
+                "  AND MAX(created_at, not_before) >= ? "
                 "  AND (delivered_at IS NULL OR delivered_at < ?) "
                 "  AND attempts < ? "
                 "ORDER BY id LIMIT 5",
-                (name, t, cutoff, COMMAND_MAX_ATTEMPTS),
+                (name, t, t - COMMAND_TTL, cutoff, COMMAND_MAX_ATTEMPTS),
             ).fetchall()
             if rows:
                 ids = [r["id"] for r in rows]
