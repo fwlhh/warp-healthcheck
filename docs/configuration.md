@@ -27,6 +27,7 @@
 | `TG_CHAT_ID`  | yes      | —                                        | Authorized user id                   |
 | `HTTP_HOST`   | no       | `0.0.0.0`                                | Bind address for the HTTP API        |
 | `HTTP_PORT`   | no       | `8080`                                   | Bind port                            |
+| `HTTP_SOCKET_TIMEOUT` | no | `30`                                 | Seconds before an idle/stalled HTTP client is dropped |
 | `DB_PATH`     | no       | `/var/lib/warp-coordinator/coordinator.db` | SQLite path                        |
 | `STALE_AFTER` | no       | `180`                                    | Node considered stale after N seconds |
 | `RETRY_UNKNOWN_LIMIT` | no | `2`                                  | Extra restarts after one ends with unknown Google country; `0` disables |
