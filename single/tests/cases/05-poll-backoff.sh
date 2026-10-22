@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2030,SC2031
+# Intentional: each case runs in its own ( ... ) subshell so that the
+# environment it sets cannot leak into the next case.
 # Regression test: when Telegram is unreachable the main loop used to spin at
 # hundreds of curl calls per second because tg_api swallows errors and
 # handle_updates returned 0 on a failed poll.

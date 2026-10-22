@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2030,SC2031
+# Intentional: each case runs in its own ( ... ) subshell so that the
+# environment it sets cannot leak into the next case.
 set -euo pipefail
 
 PROJECT_ROOT="${PROJECT_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
