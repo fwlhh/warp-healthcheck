@@ -21,6 +21,7 @@ Design notes:
 """
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -170,8 +171,75 @@ def _migrate_nodes(conn):
             log("INFO", f"migration: added nodes.{name}")
 
 
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def token_digest(token: str) -> str:
+    """What the database stores for a node token.
+
+    Tokens are 256 bits of randomness, so a plain SHA-256 is sufficient (a
+    slow password hash would only cost CPU on every request). A copy of the
+    database therefore cannot be used to impersonate a node, and the digest
+    itself is not accepted as a token.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _secure_storage() -> None:
+    """Keep the database private to its owner.
+
+    The file is created with 0600 before SQLite touches it, so there is no
+    window with umask-derived permissions, and an existing database is
+    tightened. SQLite gives -wal/-shm the same mode as the main file. The
+    parent directory is only restricted when we create it: an existing one
+    belongs to the administrator.
+    """
+    parent = DB_PATH.parent
+    created = not parent.exists()
+    parent.mkdir(parents=True, exist_ok=True)
+    if created:
+        with contextlib.suppress(OSError):
+            os.chmod(parent, 0o700)
+    os.close(os.open(DB_PATH, os.O_CREAT | os.O_RDWR, 0o600))
+    with contextlib.suppress(OSError):
+        os.chmod(DB_PATH, 0o600)
+
+
+def _migrate_hash_tokens(conn) -> None:
+    """One-way: replace plaintext node tokens by their digest.
+
+    Older versions stored tokens verbatim and cannot read digests, so a copy
+    of the database is made first (once) for a rollback.
+    """
+    rows = conn.execute("SELECT name, token FROM nodes").fetchall()
+    plain = [r for r in rows if not _DIGEST_RE.match(r["token"])]
+    if not plain:
+        return
+    backup = DB_PATH.with_name(DB_PATH.name + ".pre-token-hash")
+    if not backup.exists():
+        os.close(os.open(backup, os.O_CREAT | os.O_RDWR, 0o600))
+        dst = sqlite3.connect(str(backup))
+        try:
+            conn.backup(dst)
+        finally:
+            dst.close()
+        with contextlib.suppress(OSError):
+            os.chmod(backup, 0o600)
+    for r in plain:
+        conn.execute(
+            "UPDATE nodes SET token = ? WHERE name = ?",
+            (token_digest(r["token"]), r["name"]),
+        )
+    log(
+        "INFO",
+        f"migration: stored {len(plain)} node token(s) hashed. A copy of the "
+        f"previous database, with plaintext tokens, is at {backup}: restore it "
+        "to roll back to an older version, and delete it once the fleet works.",
+    )
+
+
 def db_init() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _secure_storage()
     conn = db_connect()
     try:
         conn.executescript(
@@ -207,6 +275,7 @@ def db_init() -> None:
         )
         _migrate_nodes(conn)
         _migrate_commands(conn)
+        _migrate_hash_tokens(conn)
         conn.execute("UPDATE commands SET attempts = 0 WHERE attempts IS NULL")
     finally:
         conn.close()
@@ -1091,9 +1160,9 @@ class Handler(BaseHTTPRequestHandler):
             ).fetchone()
         finally:
             conn.close()
-        # compare_digest raises TypeError on non-ASCII str; compare bytes.
+        # Compare digests (as bytes: compare_digest rejects non-ASCII str).
         if not r or not secrets.compare_digest(
-            r["token"].encode("utf-8"), token.encode("utf-8")
+            r["token"].encode("utf-8"), token_digest(token).encode("utf-8")
         ):
             return None
         return name
@@ -1303,13 +1372,21 @@ def cli_add_node(name):
     token = secrets.token_urlsafe(32)
     conn = db_connect()
     try:
+        existed = conn.execute(
+            "SELECT 1 FROM nodes WHERE name = ?", (name,)
+        ).fetchone()
         conn.execute(
             "INSERT INTO nodes (name, token, registered_at) VALUES (?, ?, ?) "
             "ON CONFLICT(name) DO UPDATE SET token = excluded.token",
-            (name, token, now()),
+            (name, token_digest(token), now()),
         )
     finally:
         conn.close()
+    if existed:
+        print(
+            f"note: node {name} already existed; its previous token no longer works",
+            file=sys.stderr,
+        )
     print(f"NODE_NAME={name}")
     print(f"NODE_TOKEN={token}")
 

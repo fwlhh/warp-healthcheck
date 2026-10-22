@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import socket
+import stat
 import sqlite3
 import tempfile
 import threading
@@ -788,6 +789,88 @@ class DeadmanPingTest(CoordinatorTestCase):
     def test_only_http_urls_are_used(self):
         with mock.patch.object(C, "DEADMAN_URL", "file:///etc/passwd"):
             self.assertFalse(C.deadman_ping())
+
+
+class TokenStorageTest(CoordinatorTestCase):
+    """Node tokens were stored verbatim in a world-readable database, so
+    anyone who could read the file (a backup, another local user) could
+    impersonate every node."""
+
+    def stored_token(self, name=None):
+        return self.sql("SELECT token FROM nodes WHERE name = ?", name or self.NODE)[0]["token"]
+
+    def mode(self, path):
+        return stat.S_IMODE(os.stat(path).st_mode)
+
+    def test_token_is_stored_as_a_digest_and_still_authenticates(self):
+        self.assertNotEqual(self.stored_token(), self.token)
+        self.assertEqual(self.stored_token(), C.token_digest(self.token))
+        self.assertEqual(self.call("GET", "/commands")[0], 200)
+
+    def test_the_stored_digest_is_not_accepted_as_a_token(self):
+        headers = dict(self.auth_headers(), **{"X-Token": self.stored_token()})
+        self.assertEqual(self.call("GET", "/commands", headers=headers)[0], 401)
+
+    def test_wrong_token_is_rejected(self):
+        headers = dict(self.auth_headers(), **{"X-Token": self.token[:-1] + "x"})
+        self.assertEqual(self.call("GET", "/commands", headers=headers)[0], 401)
+
+    def test_database_file_is_private_and_a_new_directory_too(self):
+        self.assertEqual(self.mode(self.db_path), 0o600)
+        self.assertEqual(self.mode(self.db_path.parent), 0o700)
+
+    def test_an_existing_world_readable_database_is_tightened(self):
+        os.chmod(self.db_path, 0o644)
+        C.db_init()
+        self.assertEqual(self.mode(self.db_path), 0o600)
+
+    def test_an_existing_directory_is_left_alone(self):
+        os.chmod(self.db_path.parent, 0o755)
+        C.db_init()
+        self.assertEqual(self.mode(self.db_path.parent), 0o755)
+
+    def test_plaintext_tokens_are_migrated_with_a_rollback_copy(self):
+        legacy = "legacy-plaintext-token-0123456789abcdefghijk"
+        self.sql("INSERT INTO nodes (name, token, registered_at) VALUES ('old', ?, 0)", legacy)
+        C.db_init()
+        self.assertEqual(self.stored_token("old"), C.token_digest(legacy))
+
+        headers = {"X-Node": "old", "X-Token": legacy}
+        self.assertEqual(self.call("GET", "/commands", headers=headers)[0], 200)
+
+        backup = self.db_path.with_name(self.db_path.name + ".pre-token-hash")
+        self.assertEqual(self.mode(backup), 0o600)
+        copy = sqlite3.connect(backup)
+        try:
+            (token,) = copy.execute("SELECT token FROM nodes WHERE name = 'old'").fetchone()
+        finally:
+            copy.close()
+        self.assertEqual(token, legacy, "the rollback copy must hold the old format")
+
+    def test_migration_is_idempotent_and_keeps_the_first_backup(self):
+        self.sql("INSERT INTO nodes (name, token, registered_at) VALUES ('old', 'plain', 0)")
+        C.db_init()
+        backup = self.db_path.with_name(self.db_path.name + ".pre-token-hash")
+        first = backup.read_bytes()
+        digest = self.stored_token("old")
+        C.db_init()
+        self.assertEqual(self.stored_token("old"), digest, "digest was hashed twice")
+        self.assertEqual(backup.read_bytes(), first)
+
+    def test_no_backup_when_there_is_nothing_to_migrate(self):
+        C.db_init()
+        self.assertFalse(self.db_path.with_name(self.db_path.name + ".pre-token-hash").exists())
+
+    def test_readding_a_node_replaces_its_token_and_says_so(self):
+        err = io.StringIO()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            C.cli_add_node(self.NODE)
+        new = next(l.split("=", 1)[1] for l in out.getvalue().splitlines() if l.startswith("NODE_TOKEN="))
+        self.assertIn("previous token no longer works", err.getvalue())
+        self.assertEqual(self.call("GET", "/commands")[0], 401)  # the old one
+        headers = dict(self.auth_headers(), **{"X-Token": new})
+        self.assertEqual(self.call("GET", "/commands", headers=headers)[0], 200)
 
 
 if __name__ == "__main__":
