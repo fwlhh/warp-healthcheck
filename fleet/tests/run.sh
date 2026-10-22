@@ -27,12 +27,21 @@ grep -q '^NODE_NAME=test-node$' "${TMP}/node.txt"
 python3 "${ROOT}/fleet/coordinator/coordinator.py" run &
 COORD_PID=$!
 
-for _ in $(seq 1 30); do
-  if curl -fsS "http://127.0.0.1:18080/commands" -H 'X-Node: x' -H 'X-Token: x' 2>/dev/null; then
+# /health needs no credentials. (The old probe sent a bogus token to
+# /commands, which always answers 401, so `curl -f` never succeeded and the
+# loop just slept for the whole timeout.)
+ready=0
+for _ in $(seq 1 50); do
+  if curl -fsS "http://127.0.0.1:18080/health" >/dev/null 2>&1; then
+    ready=1
     break
   fi
   sleep 0.2
 done
+if [[ "${ready}" -ne 1 ]]; then
+  echo "coordinator did not become ready" >&2
+  exit 1
+fi
 
 TOKEN="$(awk -F= '/^NODE_TOKEN=/{print $2}' "${TMP}/node.txt")"
 
