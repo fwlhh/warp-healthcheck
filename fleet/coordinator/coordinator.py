@@ -62,6 +62,10 @@ POLL_TIMEOUT = int(env("POLL_TIMEOUT", "25"))
 # Output the watchdog stores when it gives up on a command. A real result
 # that arrives afterwards may still replace it once (see r_result).
 LEASE_EXPIRED_OUTPUT = "lease expired after max attempts"
+# HTTP limits: nodes send small JSON documents, so anything bigger is wrong,
+# and a client that stalls must not hold a server thread forever.
+MAX_BODY_BYTES = 64 * 1024
+HTTP_SOCKET_TIMEOUT = int(env("HTTP_SOCKET_TIMEOUT", "30"))
 LOG_LEVEL = env("LOG_LEVEL", "INFO").upper()
 
 TG_TOKEN = ""
@@ -769,11 +773,27 @@ def requeue_watchdog():
 # ===========================================================================
 
 
+class HttpError(Exception):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "warp-coordinator/2.0"
+    # Applied to the connection socket: without it a client that connects and
+    # sends nothing (or a partial request) occupies a thread indefinitely.
+    timeout = HTTP_SOCKET_TIMEOUT
 
     def log_message(self, *a):
         pass
+
+    def fail(self, code, message):
+        # The body of a rejected request was not consumed; drop the connection
+        # instead of parsing leftover bytes as the next request.
+        self.close_connection = True
+        self.reply(code, {"error": message})
 
     def reply(self, code, obj):
         body = json.dumps(obj).encode()
@@ -784,7 +804,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def read_json(self):
-        n = int(self.headers.get("Content-Length", "0"))
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise HttpError(400, "bad Content-Length")
+        if n < 0:
+            raise HttpError(400, "bad Content-Length")
+        if n > MAX_BODY_BYTES:
+            raise HttpError(413, "request body too large")
         if n == 0:
             return {}
         try:
@@ -804,7 +831,10 @@ class Handler(BaseHTTPRequestHandler):
             ).fetchone()
         finally:
             conn.close()
-        if not r or not secrets.compare_digest(r["token"], token):
+        # compare_digest raises TypeError on non-ASCII str; compare bytes.
+        if not r or not secrets.compare_digest(
+            r["token"].encode("utf-8"), token.encode("utf-8")
+        ):
             return None
         return name
 
@@ -817,9 +847,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.r_commands()
             else:
                 self.reply(404, {"error": "not found"})
+        except HttpError as e:
+            self.fail(e.code, e.message)
         except Exception as e:
             log("ERROR", f"GET {path}: {type(e).__name__}: {e}")
-            self.reply(500, {"error": str(e)})
+            self.reply(500, {"error": "internal error"})
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
@@ -832,9 +864,11 @@ class Handler(BaseHTTPRequestHandler):
                 self.r_notify()
             else:
                 self.reply(404, {"error": "not found"})
+        except HttpError as e:
+            self.fail(e.code, e.message)
         except Exception as e:
             log("ERROR", f"POST {path}: {type(e).__name__}: {e}")
-            self.reply(500, {"error": str(e)})
+            self.reply(500, {"error": "internal error"})
 
     def r_health(self):
         with _state_lock:
@@ -1086,6 +1120,13 @@ def run_server():
     threading.Thread(target=bot_loop, daemon=True).start()
     threading.Thread(target=requeue_watchdog, daemon=True).start()
 
+    if HTTP_HOST in ("0.0.0.0", "::"):
+        log(
+            "WARN",
+            "HTTP API listens on all interfaces over plain HTTP; node tokens "
+            "travel in cleartext. Set HTTP_HOST to a private/WireGuard address "
+            "or firewall the port (see docs/fleet.md).",
+        )
     server = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), Handler)
     server.daemon_threads = True
     log("INFO", f"listening on {HTTP_HOST}:{HTTP_PORT}")

@@ -8,11 +8,13 @@ Run with:  python3 -m unittest discover -s fleet/tests -v
 """
 
 import contextlib
+import http.client
 import importlib.util
 import io
 import json
 import logging
 import os
+import socket
 import sqlite3
 import tempfile
 import threading
@@ -391,6 +393,64 @@ class NodeInputValidationTest(CoordinatorTestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             C.cli_add_node("fra-1.node_2")
         self.assertEqual(len(self.sql("SELECT name FROM nodes")), 2)
+
+
+class HttpHardeningTest(CoordinatorTestCase):
+    def request(self, method, path, headers, send_body=b"", timeout=3):
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=timeout)
+        self.addCleanup(conn.close)
+        conn.putrequest(method, path)
+        for key, value in headers.items():
+            conn.putheader(key, value)
+        conn.endheaders(send_body)
+        resp = conn.getresponse()
+        return resp.status, resp.read()
+
+    def test_default_socket_timeout_is_set(self):
+        self.assertIsNotNone(C.Handler.timeout)
+        self.assertLessEqual(C.Handler.timeout, 60)
+
+    def test_stalled_client_is_disconnected(self):
+        with mock.patch.object(C.Handler, "timeout", 0.5):
+            sock = socket.create_connection(("127.0.0.1", self.server.server_address[1]), timeout=5)
+            self.addCleanup(sock.close)
+            sock.sendall(b"POST /heartbeat HTTP/1.1\r\nHost: x\r\n")  # never finished
+            self.assertEqual(sock.recv(1024), b"")  # server closed the connection
+
+    def test_oversized_body_is_rejected_without_reading_it(self):
+        headers = dict(self.auth_headers(), **{"Content-Length": str(10**9)})
+        status, _ = self.request("POST", "/heartbeat", headers)
+        self.assertEqual(status, 413)
+
+    def test_malformed_content_length_is_a_client_error(self):
+        for bad in ("abc", "-1", "1.5"):
+            headers = dict(self.auth_headers(), **{"Content-Length": bad})
+            status, _ = self.request("POST", "/heartbeat", headers)
+            self.assertEqual(status, 400, bad)
+
+    def test_unauthenticated_request_never_reaches_the_body(self):
+        headers = {"X-Node": self.NODE, "X-Token": "wrong", "Content-Length": str(10**9)}
+        status, _ = self.request("POST", "/heartbeat", headers)
+        self.assertEqual(status, 401)
+
+    def test_non_ascii_token_is_unauthorized_not_a_server_error(self):
+        headers = {"X-Node": self.NODE, "X-Token": "t\u00e9st"}
+        status, body = self.request("GET", "/commands", headers)
+        self.assertEqual(status, 401)
+        self.assertNotIn(b"non-ASCII", body)
+
+    def test_internal_errors_do_not_leak_details(self):
+        with mock.patch.object(
+            C.Handler, "r_health", side_effect=RuntimeError("secret /var/lib/x")
+        ):
+            status, body = self.request("GET", "/health", {})
+        self.assertEqual(status, 500)
+        self.assertNotIn(b"secret", body)
+
+    def test_normal_requests_still_work(self):
+        status, _ = self.call("POST", "/heartbeat", {"warp_alive": True, "google_country": "DE"})
+        self.assertEqual(status, 200)
+        self.assertEqual(self.call("GET", "/commands")[1], {"commands": []})
 
 
 if __name__ == "__main__":
