@@ -402,6 +402,41 @@ def esc(s):
 
 
 # ---------------------------------------------------------------------------
+# Message building blocks: every operator-facing message is a card, a title
+# line ("icon <b>name</b> · what") followed by detail rows drawn as a tree.
+# Row values are markup built by the caller (escaped where they carry data).
+# ---------------------------------------------------------------------------
+
+
+def flag(cc):
+    """Flag emoji for a two-letter country code, or '❔' when it is not one."""
+    cc = (cc or "").strip().upper() if isinstance(cc, str) else ""
+    if len(cc) == 2 and cc.isascii() and cc.isalpha():
+        return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in cc)
+    return "❔"
+
+
+def place(cc):
+    """'🇳🇱 NL' for a valid code, '❔ unknown' for anything else."""
+    f = flag(cc)
+    return "❔ unknown" if f == "❔" else f"{f} {cc.strip().upper()}"
+
+
+def tree(*rows):
+    """Detail rows with branches: ('Google', '🇳🇱 NL') -> '├ Google: 🇳🇱 NL'."""
+    rows = [r for r in rows if r]
+    return [
+        f"{'└' if i == len(rows) - 1 else '├'} {label}: {value}"
+        for i, (label, value) in enumerate(rows)
+    ]
+
+
+def card(icon, name, what, *rows):
+    """Title line plus detail rows. `name` and `what` are plain text."""
+    return "\n".join([f"{icon} <b>{esc(name)}</b> · {esc(what)}", *tree(*rows)])
+
+
+# ---------------------------------------------------------------------------
 # Validation of data reported by nodes (untrusted: any holder of a node token)
 # ---------------------------------------------------------------------------
 
@@ -438,7 +473,13 @@ def clean_meta(raw):
     if not isinstance(raw, dict):
         return {}
     ip = raw.get("exit_ip")
+    remaining = raw.get("cooldown_remaining")
     return {
+        # The agent refused a restart because its cooldown is active.
+        "skipped": "cooldown" if raw.get("skipped") == "cooldown" else "",
+        "cooldown_remaining": (
+            remaining if type(remaining) is int and 0 <= remaining <= 86400 else 0
+        ),
         "warp_up": raw.get("warp_up") is True,
         "still_ru": raw.get("still_ru") is True,
         "country": clean_country(raw.get("country")),
@@ -447,38 +488,42 @@ def clean_meta(raw):
     }
 
 
-def _format_restart_message(name, meta, kind):
+def _format_restart_message(name, meta, kind, ok=True, output=""):
     """Build the Telegram card for a restart event.
 
-    kind: 'cmd#N restart' (manual) or 'auto-restart' (triggered by RU).
+    kind: 'restart #N' (ordered by the operator) or 'auto-restart'.
     """
-    country = (meta.get("country") or "").strip()
-    still_ru = bool(meta.get("still_ru"))
-    warp_up = bool(meta.get("warp_up"))
+    if meta.get("skipped") == "cooldown":
+        left = int(meta.get("cooldown_remaining") or 0)
+        return card(
+            "⏳", name, f"{kind} skipped", ("Cooldown", f"{left}s left, try again then")
+        )
 
-    if not warp_up:
-        icon = "🔴"
-    elif still_ru:
-        icon = "🟡"
-    elif country and country != "?":
-        icon = "🟢"
-    else:
-        icon = "🔴"
+    if not meta.get("warp_up"):
+        if not ok:  # e.g. docker compose failed: there is no report to show
+            # The agent's output starts with a header ("compose restart
+            # failed:"); the cause is at the end.
+            lines = [ln.strip() for ln in (output or "").splitlines() if ln.strip()]
+            reason = lines[-1][:160] if lines else ""
+            return card(
+                "🔴", name, f"{kind} failed", ("Reason", esc(reason)) if reason else None
+            )
+        return card("🔴", name, f"{kind} · WARP did not come up")
 
-    lines = [f"{icon} <code>{esc(name)}</code> · {esc(kind)}"]
-    if warp_up:
-        lines.append(f"Google now: <b>{esc(country or '?')}</b>")
-        cc = meta.get("cloudflare_loc")
-        if cc:
-            lines.append(f"Cloudflare loc: <code>{esc(cc)}</code>")
-        ip = meta.get("exit_ip")
-        if ip:
-            lines.append(f"Exit IP: <code>{esc(ip)}</code>")
-        if still_ru:
-            lines.append("🔴 still RU")
+    country = (meta.get("country") or "").strip().upper()
+    if meta.get("still_ru") or country == "RU":
+        icon, what = "🟡", f"{kind} · still RU"
+    elif country:
+        icon, what = "🟢", f"{kind} · done"
     else:
-        lines.append("⚠️ WARP did not come up")
-    return "\n".join(lines)
+        icon, what = "🟡", f"{kind} · country unknown"
+
+    rows = [("Google", place(country))]
+    if meta.get("cloudflare_loc"):
+        rows.append(("Cloudflare", place(meta["cloudflare_loc"])))
+    if meta.get("exit_ip"):
+        rows.append(("Exit IP", f"<code>{esc(meta['exit_ip'])}</code>"))
+    return card(icon, name, what, *rows)
 
 
 # ===========================================================================
@@ -523,8 +568,15 @@ def _schedule_unknown_retry(name):
             conn.execute("DELETE FROM meta WHERE key = ?", (key,))
             log("WARN", f"{name}: gave up after {RETRY_UNKNOWN_LIMIT} retries")
             tg_send(
-                f"⚠️ <code>{esc(name)}</code>: Google country still unknown "
-                f"after {RETRY_UNKNOWN_LIMIT} restarts, giving up"
+                card(
+                    "⚠️",
+                    name,
+                    "giving up",
+                    (
+                        "Google country",
+                        f"still unknown after {RETRY_UNKNOWN_LIMIT} restarts",
+                    ),
+                )
             )
             return
 
@@ -544,8 +596,12 @@ def _schedule_unknown_retry(name):
         conn.close()
     log("INFO", f"{name}: queued retry #{count} in {RETRY_UNKNOWN_DELAY}s")
     tg_send(
-        f"🔁 <code>{esc(name)}</code>: country still unknown, "
-        f"retry #{count}/{RETRY_UNKNOWN_LIMIT} in {fmt_dur(RETRY_UNKNOWN_DELAY)}"
+        card(
+            "🔁",
+            name,
+            "country still unknown",
+            ("Retry", f"#{count}/{RETRY_UNKNOWN_LIMIT} in {fmt_dur(RETRY_UNKNOWN_DELAY)}"),
+        )
     )
 
 
@@ -572,27 +628,28 @@ def cmd_nodes():
     finally:
         conn.close()
     if not rows:
-        tg_send("No nodes registered.")
+        tg_send("🛰 <b>Nodes</b>\n\nNo nodes registered.")
         return
     t = now()
     lines = []
     for r in rows:
         state = node_state(r, t)
-        name = r["name"]
+        name = f"<code>{esc(r['name'])}</code>"
+        country = (r["google_country"] or "").upper()
         if state == "never":
             icon, detail = "⚫", "never connected"
         elif state == "stale":
-            icon, detail = "⚫", f"stale {fmt_dur(t - r['last_heartbeat'])}"
+            icon, detail = "⚫", f"silent {fmt_dur(t - r['last_heartbeat'])}"
         elif state == "warp_down":
             icon, detail = "🔴", "WARP down"
-        elif r["google_country"] == "RU":
-            rest = t - r["last_restart"] if r["last_restart"] else 0
-            icon = "🟡"
-            detail = f"RU · restart {fmt_dur(rest)} ago" if rest else "RU"
+        elif country == "RU":
+            icon, detail = "🟡", place(country)
+            if r["last_restart"]:
+                detail += f" · restarted {fmt_dur(t - r['last_restart'])} ago"
         else:
-            icon, detail = "🟢", (r["google_country"] or "?")
-        lines.append(f"{icon} <code>{esc(name)}</code>  {esc(detail)}")
-    tg_send("\n".join(lines))
+            icon, detail = "🟢", place(country)
+        lines.append(f"{icon} {name} · {detail}")
+    tg_send("🛰 <b>Nodes</b>\n\n" + "\n".join(lines))
 
 
 def cmd_status(name):
@@ -602,33 +659,38 @@ def cmd_status(name):
     finally:
         conn.close()
     if not r:
-        tg_send(f"Unknown node: <code>{esc(name)}</code>")
+        tg_send(f"❓ Unknown node <code>{esc(name)}</code>")
         return
     t = now()
     state = node_state(r, t)
-    rest = t - r["last_restart"] if r["last_restart"] else 0
-    last_warp = "yes" if r["warp_alive"] else "no"
-    last_country = esc(r["google_country"] or "?")
-    if state == "never":
-        heartbeat = "never connected"
-    else:
-        heartbeat = f"{fmt_dur(t - r['last_heartbeat'])} ago"
+    country = (r["google_country"] or "").upper()
+    last_warp = "up" if r["warp_alive"] else "down"
+    restart = f"{fmt_dur(t - r['last_restart'])} ago" if r["last_restart"] else "never"
+    heartbeat = (
+        f"{fmt_dur(t - r['last_heartbeat'])} ago" if r["last_heartbeat"] else "never"
+    )
     if state in ("never", "stale"):
         # No fresh report: do not present the last one as the current state.
-        heartbeat += " ⚫ STALE" if state == "stale" else ""
-        warp_line = f"warp_alive: unknown (last report: {last_warp})"
-        google_line = f"google: unknown (last report: {last_country})"
+        icon, what = "⚫", "never connected" if state == "never" else "STALE"
+        google = f"unknown (last report: {place(country)})"
+        warp = f"unknown (last report: {last_warp})"
     else:
-        warp_line = f"warp_alive: {last_warp}"
-        google_line = f"google: {last_country}"
-    lines = [
-        f"<b>{esc(name)}</b>",
-        f"heartbeat: {heartbeat}",
-        warp_line,
-        google_line,
-        f"last restart: {fmt_dur(rest)} ago" if rest else "last restart: never",
-    ]
-    tg_send("\n".join(lines))
+        if state == "warp_down":
+            icon, what = "🔴", "WARP down"
+        else:
+            icon, what = ("🟡" if country == "RU" else "🟢"), "status"
+        google, warp = place(country), last_warp
+    tg_send(
+        card(
+            icon,
+            name,
+            what,
+            ("Google", google),
+            ("WARP", warp),
+            ("Heartbeat", heartbeat),
+            ("Last restart", restart),
+        )
+    )
 
 
 def cmd_restart(name):
@@ -637,7 +699,7 @@ def cmd_restart(name):
     try:
         r = conn.execute("SELECT name FROM nodes WHERE name = ?", (name,)).fetchone()
         if not r:
-            tg_send(f"Unknown node: <code>{esc(name)}</code>")
+            tg_send(f"❓ Unknown node <code>{esc(name)}</code>")
             return
         pending = conn.execute(
             "SELECT id FROM commands WHERE node = ? AND command = 'restart' "
@@ -645,7 +707,7 @@ def cmd_restart(name):
             (name,),
         ).fetchone()
         if pending:
-            tg_send(f"Restart already pending for <code>{esc(name)}</code>")
+            tg_send(card("⏳", name, "restart already pending"))
             return
         cur = conn.execute(
             "INSERT INTO commands (node, command, created_at) VALUES (?, 'restart', ?)",
@@ -656,14 +718,14 @@ def cmd_restart(name):
     finally:
         conn.close()
     log("INFO", f"queued restart #{cid} for {name}")
-    text = f"Queued restart for <code>{esc(name)}</code> (#{cid})"
     state = node_state(node, now())
+    warning = None
     if state in ("never", "stale"):
-        text += (
-            f"\n⚠️ The node is not reporting; the command expires in "
-            f"{fmt_dur(COMMAND_TTL)} if it is not picked up."
+        warning = (
+            "⚠️ Warning",
+            f"node is not reporting; expires in {fmt_dur(COMMAND_TTL)} if not picked up",
         )
-    tg_send(text)
+    tg_send(card("⏳", name, f"restart #{cid} queued", warning))
 
 
 def cmd_restart_all():
@@ -679,7 +741,7 @@ def cmd_restart_all():
         for r in rows:
             state = node_state(r, t)
             if state in ("never", "stale"):
-                skipped.append(f"{r['name']} (not reporting)")
+                skipped.append((r["name"], "not reporting"))
                 continue
             pending = conn.execute(
                 "SELECT id FROM commands WHERE node = ? AND command = 'restart' "
@@ -687,7 +749,7 @@ def cmd_restart_all():
                 (r["name"],),
             ).fetchone()
             if pending:
-                skipped.append(f"{r['name']} (already pending)")
+                skipped.append((r["name"], "already pending"))
                 continue
             conn.execute(
                 "INSERT INTO commands (node, command, created_at) VALUES (?, 'restart', ?)",
@@ -697,9 +759,11 @@ def cmd_restart_all():
     finally:
         conn.close()
     log("INFO", f"queued restart for {queued} nodes, skipped {len(skipped)}")
-    text = f"Queued restart for <b>{queued}</b> nodes"
+    text = f"🔄 <b>Restart queued</b> · {queued} node{'' if queued == 1 else 's'}"
     if skipped:
-        text += "\nSkipped: " + ", ".join(f"<code>{esc(x)}</code>" for x in skipped)
+        text += "\n⏭ Skipped:\n" + "\n".join(
+            tree(*[(f"<code>{esc(n)}</code>", why) for n, why in skipped])
+        )
     tg_send(text)
 
 
@@ -708,7 +772,7 @@ def cmd_logs(name):
     try:
         node = conn.execute("SELECT name FROM nodes WHERE name = ?", (name,)).fetchone()
         if not node:
-            tg_send(f"Unknown node: <code>{esc(name)}</code>")
+            tg_send(f"❓ Unknown node <code>{esc(name)}</code>")
             return
         r = conn.execute(
             "SELECT id, command, ok, output FROM commands "
@@ -719,12 +783,12 @@ def cmd_logs(name):
     finally:
         conn.close()
     if not r:
-        tg_send(f"Node <code>{esc(name)}</code> has no command history yet.")
+        tg_send(f"📭 <b>{esc(name)}</b> · no command history yet")
         return
     icon = "✅" if r["ok"] else "❌"
     body = esc(r["output"] or "")[:3000]
     tg_send(
-        f"{icon} <b>{esc(name)}</b> cmd#{r['id']} ({r['command']})\n<pre>{body}</pre>"
+        f"{icon} <b>{esc(name)}</b> · cmd#{r['id']} {esc(r['command'])}\n<pre>{body}</pre>"
     )
 
 
@@ -734,12 +798,15 @@ def cmd_health():
     ok = s.get("bot_alive", False)
     icon = "🟢" if ok else "🔴"
     age = now() - s.get("last_poll_ts", 0)
-    lines = [
-        f"{icon} bot_loop: {'alive' if ok else 'stalled'}",
-        f"last_poll: {fmt_dur(age)} ago",
-        f"offset: {s.get('offset', 0)}",
-    ]
-    tg_send("\n".join(lines))
+    tg_send(
+        card(
+            icon,
+            "Coordinator",
+            "healthy" if ok else "bot loop stalled",
+            ("Last poll", f"{fmt_dur(age)} ago"),
+            ("Offset", s.get("offset", 0)),
+        )
+    )
 
 
 def handle_command(text):
@@ -879,19 +946,20 @@ _monitor_started = None
 
 
 def _node_alert_text(name, row, state, told, t):
-    n = f"<code>{esc(name)}</code>"
     if state == "stale":
-        age = fmt_dur(t - row["last_heartbeat"])
-        return (
-            f"⚫ {n} stopped reporting (last heartbeat {age} ago). "
-            "The node, its agent or its network is down."
+        return card(
+            "⚫",
+            name,
+            "stopped reporting",
+            ("Last heartbeat", f"{fmt_dur(t - row['last_heartbeat'])} ago"),
+            ("Likely", "the node, its agent or its network is down"),
         )
     if state == "warp_down":
-        extra = " The node is reporting again." if told == "stale" else ""
-        return f"🔴 {n}: the WARP proxy is down on the node.{extra}"
+        note = ("Note", "the node is reporting again") if told == "stale" else None
+        return card("🔴", name, "WARP is down", ("Status", "node is up, proxy is not"), note)
     if told == "stale":
-        return f"🟢 {n} is reporting again."
-    return f"🟢 {n}: the WARP proxy is back."
+        return card("🟢", name, "reporting again")
+    return card("🟢", name, "WARP is back")
 
 
 def node_monitor_tick(t=None):
@@ -1079,8 +1147,12 @@ def requeue_watchdog():
             if expired:
                 log("WARN", f"expired {len(expired)} undelivered command(s)")
                 tg_send(
-                    "⌛ Command(s) expired undelivered: "
-                    + ", ".join(f"<code>{esc(n)}</code> #{i}" for i, n in expired)
+                    "\n".join(
+                        [
+                            "⌛ <b>Commands expired</b> · not picked up in time",
+                            *tree(*[(f"<code>{esc(n)}</code>", f"#{i}") for i, n in expired]),
+                        ]
+                    )
                 )
             if t - _last_prune >= 3600:
                 _last_prune = t
@@ -1092,7 +1164,7 @@ def requeue_watchdog():
                 log("WARN", f"requeued {requeued} stale command(s)")
             if failed:
                 log("ERROR", f"failed {failed} command(s): lease expired")
-                tg_send(f"❌ {failed} command(s) failed: lease expired")
+                tg_send(f"❌ <b>{failed} command(s) failed</b> · lease expired")
         except Exception as e:
             log("ERROR", f"requeue_watchdog: {type(e).__name__}: {e}")
 
@@ -1327,12 +1399,20 @@ class Handler(BaseHTTPRequestHandler):
         _apply_meta_to_node(name, meta)
 
         country = (meta.get("country") or "").strip()
-        log(
-            "INFO",
-            f"result cmd#{cid} from {name}: ok={ok} country={country or '?'}",
-        )
+        if meta.get("skipped"):
+            log(
+                "INFO",
+                f"result cmd#{cid} from {name}: skipped "
+                f"({meta['skipped']}, {meta['cooldown_remaining']}s left)",
+            )
+        else:
+            log(
+                "INFO",
+                f"result cmd#{cid} from {name}: ok={ok} "
+                f"warp_up={meta.get('warp_up')} country={country or '?'}",
+            )
 
-        tg_send(_format_restart_message(name, meta, f"cmd#{cid} restart"))
+        tg_send(_format_restart_message(name, meta, f"restart #{cid}", ok=ok, output=out))
 
         if ok and meta.get("warp_up") and (not country or country == "?"):
             _schedule_unknown_retry(name)
@@ -1356,7 +1436,7 @@ class Handler(BaseHTTPRequestHandler):
         if reason == "auto" and isinstance(raw_meta, dict) and raw_meta:
             tg_send(_format_restart_message(name, meta, "auto-restart"))
         elif text:
-            tg_send(f"[<code>{esc(name)}</code>] {esc(text)}")
+            tg_send(f"💬 <b>{esc(name)}</b>\n{esc(text)}")
 
         self.reply(200, {"ok": True})
 

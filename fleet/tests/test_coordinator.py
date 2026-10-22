@@ -504,15 +504,15 @@ class StaleNodeDisplayTest(CoordinatorTestCase):
         C.cmd_status(self.NODE)
         message = self.sent[-1]
         self.assertIn("STALE", message)
-        self.assertIn("warp_alive: unknown", message)
-        self.assertIn("google: unknown", message)
-        self.assertNotIn("warp_alive: yes", message)
+        self.assertIn("WARP: unknown", message)
+        self.assertIn("Google: unknown", message)
+        self.assertNotIn("WARP: up", message)
 
     def test_status_of_a_fresh_node_is_unchanged(self):
         self.beat()
         C.cmd_status(self.NODE)
-        self.assertIn("warp_alive: yes", self.sent[-1])
-        self.assertIn("google: DE", self.sent[-1])
+        self.assertIn("WARP: up", self.sent[-1])
+        self.assertIn("Google: 🇩🇪 DE", self.sent[-1])
 
     def test_node_that_never_connected_is_labelled(self):
         self.assertIn("NEVER", self.list_nodes())
@@ -575,10 +575,10 @@ class NodeAlertsTest(CoordinatorTestCase):
         self.clock[0] += 1
         self.beat(warp_alive=False)
         self.assertEqual(self.tick(), 1)
-        self.assertIn("WARP proxy is down", self.sent[-1])
+        self.assertIn("WARP is down", self.sent[-1])
         self.beat(warp_alive=True)
         self.assertEqual(self.tick(), 1)
-        self.assertIn("WARP proxy is back", self.sent[-1])
+        self.assertIn("WARP is back", self.sent[-1])
 
     def test_short_warp_outage_does_not_alert(self):
         self.beat()
@@ -684,10 +684,10 @@ class CommandExpiryTest(CoordinatorTestCase):
     def test_restart_is_not_blocked_by_an_expired_command(self):
         self.beat()
         C.cmd_restart(self.NODE)
-        self.assertIn("Queued", self.sent[-1])
+        self.assertIn("queued", self.sent[-1])
         self.clock[0] += 18 * 86400
         C.cmd_restart(self.NODE)
-        self.assertIn("Queued", self.sent[-1])
+        self.assertIn("queued", self.sent[-1])
         self.assertNotIn("already pending", self.sent[-1])
 
     def test_restart_of_a_silent_node_warns(self):
@@ -712,9 +712,9 @@ class CommandExpiryTest(CoordinatorTestCase):
             "SELECT node FROM commands WHERE result_at IS NULL")}
         self.assertEqual(queued, {"busy", "fresh", "n1"})
         message = self.sent[-1]
-        self.assertIn("Queued restart for <b>2</b>", message)
-        self.assertIn("silent (not reporting)", message)
-        self.assertIn("busy (already pending)", message)
+        self.assertIn("Restart queued</b> · 2 nodes", message)
+        self.assertIn("<code>silent</code>: not reporting", message)
+        self.assertIn("<code>busy</code>: already pending", message)
 
     def test_old_finished_commands_are_pruned(self):
         t = self.clock[0]
@@ -871,6 +871,111 @@ class TokenStorageTest(CoordinatorTestCase):
         self.assertEqual(self.call("GET", "/commands")[0], 401)  # the old one
         headers = dict(self.auth_headers(), **{"X-Token": new})
         self.assertEqual(self.call("GET", "/commands", headers=headers)[0], 200)
+
+
+class RestartCardTest(CoordinatorTestCase):
+    """What the operator reads after /restart. A cooldown refusal used to be
+    drawn as "WARP did not come up" (the agent sent an empty report) and the
+    log said "ok=False country=?"."""
+
+    def post_result(self, meta, ok=True, output=""):
+        self.queue_restart()
+        (cmd,) = self.deliver()
+        self.sent.clear()
+        return self.call(
+            "POST", "/result", {"id": cmd["id"], "ok": ok, "output": output, "meta": meta}
+        ), cmd["id"]
+
+    def test_cooldown_refusal_is_not_reported_as_a_failure(self):
+        (status, _), cid = self.post_result(
+            {"skipped": "cooldown", "cooldown_remaining": 42}, ok=False,
+            output="restart skipped: cooldown active (42s remaining)",
+        )
+        self.assertEqual(status, 200)
+        (message,) = self.sent
+        self.assertIn(f"restart #{cid} skipped", message)
+        self.assertIn("Cooldown: 42s left", message)
+        self.assertNotIn("WARP did not come up", message)
+        self.assertNotIn("🔴", message)
+
+    def test_cooldown_refusal_changes_nothing_else(self):
+        self.sql("UPDATE nodes SET google_country = 'NL', last_restart = 5 WHERE name = ?", self.NODE)
+        with mock.patch.object(C, "RETRY_UNKNOWN_LIMIT", 5, create=True):
+            self.post_result({"skipped": "cooldown", "cooldown_remaining": 10}, ok=False)
+        (row,) = self.sql("SELECT google_country, last_restart FROM nodes WHERE name = ?", self.NODE)
+        self.assertEqual((row["google_country"], row["last_restart"]), ("NL", 5))
+        self.assertEqual(self.pending_restarts(), [], "a refusal must not schedule a retry")
+
+    def test_failed_restart_shows_the_cause_not_a_wrong_diagnosis(self):
+        self.post_result({}, ok=False,
+                         output="compose restart failed:\nCannot connect to the Docker daemon")
+        (message,) = self.sent
+        self.assertIn("failed", message)
+        self.assertIn("Reason: Cannot connect to the Docker daemon", message)
+        self.assertNotIn("WARP did not come up", message)
+
+    def test_warp_that_did_not_come_up_is_still_reported_as_such(self):
+        self.post_result({"warp_up": False}, ok=True)
+        self.assertIn("WARP did not come up", self.sent[0])
+        self.assertIn("🔴", self.sent[0])
+
+    def test_successful_restart_card(self):
+        self.post_result({"warp_up": True, "country": "nl", "cloudflare_loc": "NL",
+                          "exit_ip": "2a09:bac5:4e32:c8::14:2bd"})
+        (message,) = self.sent
+        self.assertTrue(message.startswith("🟢 <b>n1</b> · restart #"))
+        self.assertIn("Google: 🇳🇱 NL", message)
+        self.assertIn("Cloudflare: 🇳🇱 NL", message)
+        self.assertIn("Exit IP: <code>2a09:bac5:4e32:c8::14:2bd</code>", message)
+
+    def test_still_ru_card_is_a_warning(self):
+        self.post_result({"warp_up": True, "country": "RU", "still_ru": True})
+        self.assertTrue(self.sent[0].startswith("🟡"))
+        self.assertIn("still RU", self.sent[0])
+        self.assertIn("Google: 🇷🇺 RU", self.sent[0])
+
+    def test_unknown_country_card(self):
+        self.post_result({"warp_up": True, "country": ""})
+        self.assertIn("country unknown", self.sent[0])
+        self.assertIn("Google: ❔ unknown", self.sent[0])
+
+    def test_result_log_line_says_what_happened(self):
+        with self.assertLogs(C.LOG, level="INFO") as logs:
+            logging.disable(logging.NOTSET)
+            try:
+                self.post_result({"skipped": "cooldown", "cooldown_remaining": 42}, ok=False)
+            finally:
+                logging.disable(logging.CRITICAL)
+        text = "\n".join(logs.output)
+        self.assertIn("skipped (cooldown, 42s left)", text)
+        self.assertNotIn("country=?", text)
+
+    def test_meta_whitelist_accepts_only_known_skip_reasons(self):
+        self.assertEqual(C.clean_meta({"skipped": "cooldown", "cooldown_remaining": 7})["skipped"], "cooldown")
+        for bad in ("<b>x", 1, None, "other"):
+            self.assertEqual(C.clean_meta({"skipped": bad})["skipped"], "", bad)
+        for bad in (-1, 10**9, "7", 1.5, None, True and "x"):
+            self.assertEqual(C.clean_meta({"cooldown_remaining": bad})["cooldown_remaining"], 0, bad)
+
+
+class MessageHelpersTest(unittest.TestCase):
+    def test_flags(self):
+        self.assertEqual(C.flag("nl"), "🇳🇱")
+        self.assertEqual(C.flag("RU"), "🇷🇺")
+        for bad in ("", None, "N", "NLD", "1x", "<b", "é\u00e9", 5):
+            self.assertEqual(C.flag(bad), "❔", bad)
+
+    def test_place_never_echoes_unvalidated_text(self):
+        self.assertEqual(C.place("de"), "🇩🇪 DE")
+        self.assertEqual(C.place('<a href="x">'), "❔ unknown")
+
+    def test_card_escapes_name_and_title(self):
+        self.assertEqual(C.card("🟢", "<b>x", "a&b"), "🟢 <b>&lt;b&gt;x</b> · a&amp;b")
+
+    def test_tree_branches(self):
+        self.assertEqual(C.tree(("A", "1"), None, ("B", "2")), ["├ A: 1", "└ B: 2"])
+        self.assertEqual(C.tree(("A", "1")), ["└ A: 1"])
+        self.assertEqual(C.tree(), [])
 
 
 if __name__ == "__main__":
