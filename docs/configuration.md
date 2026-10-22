@@ -47,6 +47,6 @@
 | `HEARTBEAT_INTERVAL` | no       | `60`                 | Seconds between heartbeats                  |
 | `POLL_INTERVAL`      | no       | `5`                  | Seconds between command polls               |
 | `CHECK_INTERVAL`     | no       | `300`                | Seconds between Google checks               |
-| `RESTART_COOLDOWN`   | no       | `300`                | Minimum seconds between restarts            |
+| `RESTART_COOLDOWN`   | no       | `300`                | Minimum seconds between restarts, manual (`/restart`) and automatic alike |
 | `CURL_TIMEOUT`       | no       | `10`                 | Google probe timeout                        |
 | `STATE_DIR`          | no       | `/var/lib/warp-agent` | Where the restart timestamp lives           |
