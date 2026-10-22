@@ -26,7 +26,5 @@ jobs:
         run: |
           python3 -m py_compile fleet/coordinator/coordinator.py
           python3 -m py_compile fleet/agent/agent.py
-      - name: fleet tests
-        run: |
-          chmod +x fleet/tests/run.sh
-          fleet/tests/run.sh
+      - name: fleet tests (smoke + unit)
+        run: make test-fleet
