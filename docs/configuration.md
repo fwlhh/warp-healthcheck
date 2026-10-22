@@ -12,7 +12,7 @@
 | `COMPOSE_FILE`     | no       | `docker-compose.yml`   | Compose filename                              |
 | `COMPOSE_SERVICE`  | no       | `warp`                 | Service name to restart                       |
 | `CHECK_INTERVAL`   | no       | `300`                  | Seconds between Google checks                 |
-| `RESTART_COOLDOWN` | no       | `300`                  | Minimum seconds between restarts              |
+| `RESTART_COOLDOWN` | no       | `60`                   | Minimum seconds between restarts              |
 | `POLL_TIMEOUT`     | no       | `25`                   | Telegram long-polling timeout                 |
 | `POLL_BACKOFF_MIN` | no       | `5`                    | First retry delay (s) after a failed Telegram poll |
 | `POLL_BACKOFF_MAX` | no       | `60`                   | Cap for the doubling retry delay (s)          |
@@ -31,7 +31,7 @@
 | `DB_PATH`     | no       | `/var/lib/warp-coordinator/coordinator.db` | SQLite path                        |
 | `STALE_AFTER` | no       | `180`                                    | Node considered stale after N seconds |
 | `RETRY_UNKNOWN_LIMIT` | no | `2`                                  | Extra restarts after one ends with unknown Google country; `0` disables |
-| `RETRY_UNKNOWN_DELAY` | no | `330`                                | Seconds before such a retry is delivered; keep above the agents' `RESTART_COOLDOWN` |
+| `RETRY_UNKNOWN_DELAY` | no | `90`                                 | Seconds before such a retry is delivered; keep above the agents' `RESTART_COOLDOWN` |
 | `NODE_ALERTS` | no | `1` | Message when a node stops reporting or loses WARP, and when it recovers; `0` disables |
 | `WARP_DOWN_ALERT_AFTER` | no | `120` | Seconds WARP must stay down before alerting (ordinary restarts do not page) |
 | `MONITOR_INTERVAL` | no | `30` | Seconds between monitor passes |
@@ -54,6 +54,6 @@
 | `HEARTBEAT_INTERVAL` | no       | `60`                 | Seconds between heartbeats                  |
 | `POLL_INTERVAL`      | no       | `5`                  | Seconds between command polls               |
 | `CHECK_INTERVAL`     | no       | `300`                | Seconds between Google checks               |
-| `RESTART_COOLDOWN`   | no       | `300`                | Minimum seconds between restarts, manual (`/restart`) and automatic alike |
+| `RESTART_COOLDOWN`   | no       | `60`                 | Minimum seconds between restarts, manual (`/restart`) and automatic alike |
 | `CURL_TIMEOUT`       | no       | `10`                 | Google probe timeout                        |
 | `STATE_DIR`          | no       | `/var/lib/warp-agent` | Where the restart timestamp lives           |

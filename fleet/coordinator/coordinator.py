@@ -65,7 +65,7 @@ DEADMAN_INTERVAL = int(env("DEADMAN_INTERVAL", "60"))
 COMMAND_LEASE = int(env("COMMAND_LEASE", "120"))
 COMMAND_MAX_ATTEMPTS = int(env("COMMAND_MAX_ATTEMPTS", "3"))
 RETRY_UNKNOWN_LIMIT = int(env("RETRY_UNKNOWN_LIMIT", "2"))
-RETRY_UNKNOWN_DELAY = int(env("RETRY_UNKNOWN_DELAY", "330"))
+RETRY_UNKNOWN_DELAY = int(env("RETRY_UNKNOWN_DELAY", "90"))
 # A command nobody fetched within COMMAND_TTL is stale intent: drop it rather
 # than run it whenever the node next appears. Never shorter than a delayed
 # retry plus a delivery window.

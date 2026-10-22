@@ -47,7 +47,7 @@ COMPOSE_SERVICE = env("COMPOSE_SERVICE", "warp")
 HEARTBEAT_INTERVAL = int(env("HEARTBEAT_INTERVAL", "60"))
 POLL_INTERVAL = int(env("POLL_INTERVAL", "5"))
 CHECK_INTERVAL = int(env("CHECK_INTERVAL", "300"))
-RESTART_COOLDOWN = int(env("RESTART_COOLDOWN", "300"))
+RESTART_COOLDOWN = int(env("RESTART_COOLDOWN", "60"))
 CURL_TIMEOUT = int(env("CURL_TIMEOUT", "30"))
 HTTP_TIMEOUT = int(env("HTTP_TIMEOUT", "20"))
 WARP_BOOT_TIMEOUT = int(env("WARP_BOOT_TIMEOUT", "60"))
@@ -112,6 +112,23 @@ def _save_state(s: dict) -> None:
 
 def get_last_restart():
     return int(_load_state().get("last_restart", 0) or 0)
+
+
+# What the heartbeat reports. This is shared state, not locals of main(), so
+# that a restart (manual or automatic) refreshes it. As locals they were only
+# updated by the periodic check every CHECK_INTERVAL, and the next heartbeat
+# repeated the pre-restart country, overwriting the fresh one the coordinator
+# had just received with the restart result ("RU" again for minutes).
+STATE = {"alive": False, "google_country": "", "heartbeat_now": False}
+
+
+def remember_restart(report):
+    """Adopt the result of a restart and send a heartbeat right away."""
+    up = bool(report.get("warp_up"))
+    country = report.get("country") or ""
+    STATE["alive"] = up
+    STATE["google_country"] = country if up and country != "?" else ""
+    STATE["heartbeat_now"] = True
 
 
 def cooldown_remaining(now=None) -> int:
@@ -420,11 +437,14 @@ def handle_command(c):
     if remaining > 0:
         out = f"restart skipped: cooldown active ({remaining}s remaining)"
         log("INFO", f"cmd#{cid}: {out}")
-        ok, report = False, {}
+        # Say what happened. An empty report would be read by the coordinator
+        # as "WARP did not come up".
+        ok, report = False, {"skipped": "cooldown", "cooldown_remaining": remaining}
     else:
         ok, out, report = do_restart_and_report()
         if ok:
             set_last_restart(int(time.time()))
+            remember_restart(report)
 
     payload = {"id": cid, "ok": ok, "output": out[-4000:], "meta": report}
     sent, _ = http_post("/result", payload)
@@ -445,8 +465,6 @@ def main():
 
     last_check = 0
     last_heartbeat = 0
-    google_country = ""
-    alive = False
 
     while True:
         t = time.time()
@@ -455,15 +473,16 @@ def main():
         if t - last_check >= CHECK_INTERVAL:
             last_check = t
             if warp_alive():
-                alive = True
-                google_country = detect_google_country()
-                log("INFO", f"check: google={google_country or '?'}")
-                if google_country == "RU":
+                STATE["alive"] = True
+                STATE["google_country"] = detect_google_country()
+                log("INFO", f"check: google={STATE['google_country'] or '?'}")
+                if STATE["google_country"] == "RU":
                     if cooldown_remaining(t) == 0:
                         log("WARN", "auto: Google=RU, restarting")
                         ok, out, report = do_restart_and_report()
                         if ok:
                             set_last_restart(int(t))
+                            remember_restart(report)
                             http_post(
                                 "/notify",
                                 {
@@ -485,18 +504,19 @@ def main():
                     else:
                         log("INFO", "auto: RU but cooldown active")
             else:
-                alive = False
-                google_country = ""
+                STATE["alive"] = False
+                STATE["google_country"] = ""
                 log("WARN", "warp unreachable")
 
-        # 2. Heartbeat.
-        if t - last_heartbeat >= HEARTBEAT_INTERVAL:
+        # 2. Heartbeat: on schedule, and right after a restart.
+        if STATE["heartbeat_now"] or t - last_heartbeat >= HEARTBEAT_INTERVAL:
             last_heartbeat = t
+            STATE["heartbeat_now"] = False
             http_post(
                 "/heartbeat",
                 {
-                    "google_country": google_country or None,
-                    "warp_alive": alive,
+                    "google_country": STATE["google_country"] or None,
+                    "warp_alive": STATE["alive"],
                     "last_restart": get_last_restart(),
                 },
             )
