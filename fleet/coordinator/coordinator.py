@@ -58,6 +58,9 @@ COMMAND_MAX_ATTEMPTS = int(env("COMMAND_MAX_ATTEMPTS", "3"))
 RETRY_UNKNOWN_LIMIT = int(env("RETRY_UNKNOWN_LIMIT", "2"))
 RETRY_UNKNOWN_DELAY = int(env("RETRY_UNKNOWN_DELAY", "330"))
 POLL_TIMEOUT = int(env("POLL_TIMEOUT", "25"))
+# Output the watchdog stores when it gives up on a command. A real result
+# that arrives afterwards may still replace it once (see r_result).
+LEASE_EXPIRED_OUTPUT = "lease expired after max attempts"
 LOG_LEVEL = env("LOG_LEVEL", "INFO").upper()
 
 TG_TOKEN = ""
@@ -699,7 +702,7 @@ def requeue_watchdog():
                 cur = conn.execute(
                     "UPDATE commands SET ok = 0, output = ?, result_at = ? "
                     "WHERE result_at IS NULL AND attempts >= ?",
-                    ("lease expired after max attempts", t, COMMAND_MAX_ATTEMPTS),
+                    (LEASE_EXPIRED_OUTPUT, t, COMMAND_MAX_ATTEMPTS),
                 )
                 failed = cur.rowcount
             finally:
@@ -878,15 +881,29 @@ class Handler(BaseHTTPRequestHandler):
         out = str(b.get("output", ""))[:4000]
         meta = b.get("meta") or {}
 
+        # Record the result exactly once. The agent re-sends a result when the
+        # response was lost, so a repeat must not notify, update the node or
+        # schedule another retry. The only closed command that may be
+        # overwritten is one the watchdog failed by timeout: the real outcome
+        # is more useful than the synthetic failure.
         conn = db_connect()
         try:
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE commands SET ok = ?, output = ?, result_at = ? "
-                "WHERE id = ? AND node = ?",
-                (1 if ok else 0, out, now(), cid, name),
+                "WHERE id = ? AND node = ? "
+                "AND (result_at IS NULL OR output = ?)",
+                (1 if ok else 0, out, now(), cid, name, LEASE_EXPIRED_OUTPUT),
             )
+            recorded = cur.rowcount == 1
         finally:
             conn.close()
+
+        if not recorded:
+            log("INFO", f"ignored result for cmd#{cid} from {name}: not open")
+            # 200 so the agent drops it from its pending queue instead of
+            # resending the same payload forever.
+            self.reply(200, {"ok": True, "ignored": True})
+            return
 
         _apply_meta_to_node(name, meta)
 
