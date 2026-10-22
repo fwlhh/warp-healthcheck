@@ -296,6 +296,22 @@ def fmt_dur(sec):
     return f"{sec // 86400}d"
 
 
+def node_state(row, t):
+    """Judge a node from its last heartbeat: 'never', 'stale', 'warp_down', 'ok'.
+
+    The stored warp_alive / google_country are only the node's *last report*.
+    Once heartbeats stop they say nothing about the present, so every view of
+    a node (Telegram, CLI, alerts) must go through this check first.
+    """
+    if not row["last_heartbeat"]:
+        return "never"
+    if t - row["last_heartbeat"] > STALE_AFTER:
+        return "stale"
+    if not row["warp_alive"]:
+        return "warp_down"
+    return "ok"
+
+
 def esc(s):
     return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -476,11 +492,13 @@ def cmd_nodes():
     t = now()
     lines = []
     for r in rows:
-        age = t - r["last_heartbeat"] if r["last_heartbeat"] else 999999
+        state = node_state(r, t)
         name = r["name"]
-        if age > STALE_AFTER:
-            icon, detail = "⚫", f"stale {fmt_dur(age)}"
-        elif not r["warp_alive"]:
+        if state == "never":
+            icon, detail = "⚫", "never connected"
+        elif state == "stale":
+            icon, detail = "⚫", f"stale {fmt_dur(t - r['last_heartbeat'])}"
+        elif state == "warp_down":
             icon, detail = "🔴", "WARP down"
         elif r["google_country"] == "RU":
             rest = t - r["last_restart"] if r["last_restart"] else 0
@@ -502,13 +520,27 @@ def cmd_status(name):
         tg_send(f"Unknown node: <code>{esc(name)}</code>")
         return
     t = now()
-    age = t - r["last_heartbeat"] if r["last_heartbeat"] else 0
+    state = node_state(r, t)
     rest = t - r["last_restart"] if r["last_restart"] else 0
+    last_warp = "yes" if r["warp_alive"] else "no"
+    last_country = esc(r["google_country"] or "?")
+    if state == "never":
+        heartbeat = "never connected"
+    else:
+        heartbeat = f"{fmt_dur(t - r['last_heartbeat'])} ago"
+    if state in ("never", "stale"):
+        # No fresh report: do not present the last one as the current state.
+        heartbeat += " ⚫ STALE" if state == "stale" else ""
+        warp_line = f"warp_alive: unknown (last report: {last_warp})"
+        google_line = f"google: unknown (last report: {last_country})"
+    else:
+        warp_line = f"warp_alive: {last_warp}"
+        google_line = f"google: {last_country}"
     lines = [
         f"<b>{esc(name)}</b>",
-        f"heartbeat: {fmt_dur(age)} ago",
-        f"warp_alive: {'yes' if r['warp_alive'] else 'no'}",
-        f"google: {esc(r['google_country'] or '?')}",
+        f"heartbeat: {heartbeat}",
+        warp_line,
+        google_line,
         f"last restart: {fmt_dur(rest)} ago" if rest else "last restart: never",
     ]
     tg_send("\n".join(lines))
@@ -1073,13 +1105,25 @@ def cli_list_nodes():
         return
     t = now()
     for r in rows:
-        age = t - r["last_heartbeat"] if r["last_heartbeat"] else -1
-        age_s = f"{age}s" if age >= 0 else "never"
-        print(
-            f"{r['name']:30s} hb={age_s:>8s} "
-            f"country={r['google_country'] or '?':>3s} "
-            f"alive={'yes' if r['warp_alive'] else 'no'}"
+        state = node_state(r, t)
+        country = r["google_country"] or "?"
+        alive = "yes" if r["warp_alive"] else "no"
+        if state == "never":
+            detail = "hb=never"
+        elif state == "stale":
+            detail = (
+                f"hb={fmt_dur(t - r['last_heartbeat'])} ago "
+                f"(last report: country={country} alive={alive})"
+            )
+        else:
+            detail = (
+                f"hb={fmt_dur(t - r['last_heartbeat'])} "
+                f"country={country} alive={alive}"
+            )
+        label = {"never": "NEVER", "stale": "STALE", "warp_down": "WARP-DOWN"}.get(
+            state, "OK"
         )
+        print(f"{r['name']:30s} {label:9s} {detail}")
 
 
 # ===========================================================================

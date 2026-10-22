@@ -453,5 +453,63 @@ class HttpHardeningTest(CoordinatorTestCase):
         self.assertEqual(self.call("GET", "/commands")[1], {"commands": []})
 
 
+class StaleNodeDisplayTest(CoordinatorTestCase):
+    """A node that stopped heartbeating used to keep showing its last report
+    (e.g. alive=yes) in `list-nodes` and /status."""
+
+    def row(self):
+        return self.sql("SELECT * FROM nodes WHERE name = ?", self.NODE)[0]
+
+    def beat(self, **fields):
+        self.call("POST", "/heartbeat", {"warp_alive": True, "google_country": "DE", **fields})
+
+    def list_nodes(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            C.cli_list_nodes()
+        return out.getvalue()
+
+    def test_node_state_classification(self):
+        self.assertEqual(C.node_state(self.row(), self.clock[0]), "never")
+        self.beat()
+        self.assertEqual(C.node_state(self.row(), self.clock[0]), "ok")
+        self.beat(warp_alive=False)
+        self.assertEqual(C.node_state(self.row(), self.clock[0]), "warp_down")
+        self.clock[0] += C.STALE_AFTER + 1
+        self.assertEqual(C.node_state(self.row(), self.clock[0]), "stale")
+
+    def test_list_nodes_does_not_report_a_silent_node_as_alive(self):
+        self.beat()
+        self.assertIn(" OK ", self.list_nodes())
+        self.clock[0] += 18 * 86400
+        line = self.list_nodes().splitlines()[0]
+        self.assertIn("STALE", line)
+        self.assertIn("18d ago", line)
+        self.assertNotIn(" OK ", line)
+        # the old report may be shown, but only labelled as such
+        self.assertIn("last report", line)
+
+    def test_status_does_not_report_a_silent_node_as_alive(self):
+        self.beat()
+        self.clock[0] += 18 * 86400
+        C.cmd_status(self.NODE)
+        message = self.sent[-1]
+        self.assertIn("STALE", message)
+        self.assertIn("warp_alive: unknown", message)
+        self.assertIn("google: unknown", message)
+        self.assertNotIn("warp_alive: yes", message)
+
+    def test_status_of_a_fresh_node_is_unchanged(self):
+        self.beat()
+        C.cmd_status(self.NODE)
+        self.assertIn("warp_alive: yes", self.sent[-1])
+        self.assertIn("google: DE", self.sent[-1])
+
+    def test_node_that_never_connected_is_labelled(self):
+        self.assertIn("NEVER", self.list_nodes())
+        C.cmd_nodes()
+        self.assertIn("never connected", self.sent[-1])
+
+
 if __name__ == "__main__":
     unittest.main()
