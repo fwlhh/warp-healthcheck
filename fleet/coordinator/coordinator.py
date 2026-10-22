@@ -58,6 +58,9 @@ STALE_AFTER = int(env("STALE_AFTER", "180"))
 NODE_ALERTS = env("NODE_ALERTS", "1").lower() not in ("0", "false", "no", "off", "")
 WARP_DOWN_ALERT_AFTER = int(env("WARP_DOWN_ALERT_AFTER", "120"))
 MONITOR_INTERVAL = int(env("MONITOR_INTERVAL", "30"))
+# Dead-man's switch: ping this URL while the coordinator can still alert you.
+DEADMAN_URL = env("DEADMAN_URL", "")
+DEADMAN_INTERVAL = int(env("DEADMAN_INTERVAL", "60"))
 COMMAND_LEASE = int(env("COMMAND_LEASE", "120"))
 COMMAND_MAX_ATTEMPTS = int(env("COMMAND_MAX_ATTEMPTS", "3"))
 RETRY_UNKNOWN_LIMIT = int(env("RETRY_UNKNOWN_LIMIT", "2"))
@@ -880,12 +883,50 @@ def node_monitor_tick(t=None):
 
 def node_monitor():
     log("INFO", "node_monitor started")
+    _update_state(monitor_ts=now())
     while True:
         time.sleep(MONITOR_INTERVAL)
         try:
             node_monitor_tick()
+            _update_state(monitor_ts=now())
         except Exception as e:
             log("ERROR", f"node_monitor: {type(e).__name__}: {e}")
+
+
+def deadman_ping():
+    """Ping DEADMAN_URL if, and only if, the coordinator can still do its job.
+
+    An external service (healthchecks.io, Uptime Kuma push monitor, ...)
+    raises the alarm when the pings stop. So the ping is withheld while the
+    Telegram path is broken (alerts could not reach you) and while the node
+    monitor thread is stuck or dead, not just when the process is gone.
+    Returns True if a ping was delivered.
+    """
+    if not DEADMAN_URL.startswith(("http://", "https://")):
+        log("ERROR", "DEADMAN_URL must start with http:// or https://")
+        return False
+    with _state_lock:
+        st = dict(_state)
+    if not st.get("bot_alive", False):
+        log("WARN", "deadman: not pinging, Telegram is unreachable")
+        return False
+    if NODE_ALERTS and now() - st.get("monitor_ts", 0) > 3 * MONITOR_INTERVAL + 30:
+        log("WARN", "deadman: not pinging, node monitor is not running")
+        return False
+    try:
+        with urllib.request.urlopen(DEADMAN_URL, timeout=10) as resp:
+            resp.read(1)
+        return True
+    except Exception as e:
+        log("WARN", f"deadman ping failed: {type(e).__name__}: {e}")
+        return False
+
+
+def deadman_loop():
+    log("INFO", f"deadman ping every {DEADMAN_INTERVAL}s")
+    while True:
+        deadman_ping()
+        time.sleep(DEADMAN_INTERVAL)
 
 
 # ===========================================================================
@@ -1359,6 +1400,8 @@ def run_server():
     threading.Thread(target=requeue_watchdog, daemon=True).start()
     if NODE_ALERTS:
         threading.Thread(target=node_monitor, daemon=True).start()
+    if DEADMAN_URL:
+        threading.Thread(target=deadman_loop, daemon=True).start()
 
     if HTTP_HOST in ("0.0.0.0", "::"):
         log(

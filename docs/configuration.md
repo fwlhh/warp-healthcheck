@@ -35,6 +35,8 @@
 | `NODE_ALERTS` | no | `1` | Message when a node stops reporting or loses WARP, and when it recovers; `0` disables |
 | `WARP_DOWN_ALERT_AFTER` | no | `120` | Seconds WARP must stay down before alerting (ordinary restarts do not page) |
 | `MONITOR_INTERVAL` | no | `30` | Seconds between monitor passes |
+| `DEADMAN_URL` | no | _(empty)_ | URL pinged every `DEADMAN_INTERVAL` s while the coordinator can still alert you (Telegram reachable, monitor running). Point it at a push monitor (healthchecks.io, Uptime Kuma) so *its* alarm tells you when the coordinator itself is gone |
+| `DEADMAN_INTERVAL` | no | `60` | Seconds between pings |
 | `COMMAND_TTL` | no | `600` | Seconds after which a command no node fetched is dropped (never below `RETRY_UNKNOWN_DELAY`+120) |
 | `COMMAND_RETENTION_DAYS` | no | `30` | Finished commands older than this are deleted |
 

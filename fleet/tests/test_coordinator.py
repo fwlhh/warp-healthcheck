@@ -725,5 +725,70 @@ class CommandExpiryTest(CoordinatorTestCase):
         self.assertEqual(len(self.sql("SELECT id FROM commands")), 2)
 
 
+class DeadmanPingTest(CoordinatorTestCase):
+    """The coordinator is itself a single point of silence: if it dies, or
+    cannot reach Telegram, every alert stops at once. It therefore pings an
+    external service that raises the alarm when the pings stop."""
+
+    def setUp(self):
+        super().setUp()
+        self.pings = []
+        pings = self.pings
+
+        class Ping(C.BaseHTTPRequestHandler):
+            def do_GET(self):
+                pings.append(self.path)
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"OK")
+
+            def log_message(self, *a):
+                pass
+
+        ping_srv = ThreadingHTTPServer(("127.0.0.1", 0), Ping)
+        threading.Thread(target=ping_srv.serve_forever, daemon=True).start()
+        self.addCleanup(ping_srv.server_close)
+        self.addCleanup(ping_srv.shutdown)
+        self.url = f"http://127.0.0.1:{ping_srv.server_address[1]}/ping/abc"
+        for name, value in {"DEADMAN_URL": self.url, "NODE_ALERTS": True}.items():
+            patcher = mock.patch.object(C, name, value, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.set_state(bot_alive=True, monitor_ts=self.clock[0])
+
+    def set_state(self, **kw):
+        with C._state_lock:
+            C._state.update(kw)
+        self.addCleanup(lambda: C._state.clear())
+
+    def test_pings_when_the_coordinator_is_healthy(self):
+        self.assertTrue(C.deadman_ping())
+        self.assertEqual(self.pings, ["/ping/abc"])
+
+    def test_no_ping_while_telegram_is_unreachable(self):
+        self.set_state(bot_alive=False)
+        self.assertFalse(C.deadman_ping())
+        self.assertEqual(self.pings, [])
+
+    def test_no_ping_when_the_node_monitor_has_stopped(self):
+        self.clock[0] += 3 * C.MONITOR_INTERVAL + 31
+        self.assertFalse(C.deadman_ping())
+        self.assertEqual(self.pings, [])
+
+    def test_monitor_state_is_ignored_when_node_alerts_are_off(self):
+        self.clock[0] += 10 * C.MONITOR_INTERVAL
+        with mock.patch.object(C, "NODE_ALERTS", False):
+            self.assertTrue(C.deadman_ping())
+
+    def test_unreachable_ping_target_is_not_fatal(self):
+        with mock.patch.object(C, "DEADMAN_URL", "http://127.0.0.1:1/x"):
+            self.assertFalse(C.deadman_ping())
+
+    def test_only_http_urls_are_used(self):
+        with mock.patch.object(C, "DEADMAN_URL", "file:///etc/passwd"):
+            self.assertFalse(C.deadman_ping())
+
+
 if __name__ == "__main__":
     unittest.main()
