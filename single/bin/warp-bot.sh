@@ -28,6 +28,11 @@ readonly WARP_PROXY="${WARP_PROXY:-127.0.0.1:1080}"
 readonly COMPOSE_DIR="${COMPOSE_DIR:-/opt/warp}"
 readonly COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.yml}"
 readonly COMPOSE_SERVICE="${COMPOSE_SERVICE:-warp}"
+readonly WARP_NAME="${WARP_NAME:-}"
+# Countries in which Google refuses the service: Google seeing one of them as
+# the exit's country restarts that WARP (space or comma separated). Set but
+# empty means "none": monitor only. (${VAR-x}, not ${VAR:-x}, keeps it empty.)
+readonly BAD_COUNTRIES="${BAD_COUNTRIES-RU}"
 
 readonly CHECK_INTERVAL="${CHECK_INTERVAL:-300}"
 readonly RESTART_COOLDOWN="${RESTART_COOLDOWN:-60}"
@@ -54,8 +59,12 @@ readonly EXIT_COOLDOWN=2
 # Logging
 # ---------------------------------------------------------------------------
 
+# " / name" of the WARP being handled, or nothing when the node has just one
+# WARP with the default name. Set by select_warp.
+CUR_WARP_TAG=''
+
 log() {
-  printf '[%s] [%s] %s\n' "$(date -Is)" "${NODE_NAME}" "$*" >&2
+  printf '[%s] [%s%s] %s\n' "$(date -Is)" "${NODE_NAME}" "${CUR_WARP_TAG}" "$*" >&2
 }
 
 die() {
@@ -91,6 +100,153 @@ require_commands() {
   done
 }
 
+# ---------------------------------------------------------------------------
+# WARP instances
+#
+# WARP #1 is the long-standing WARP_PROXY / COMPOSE_SERVICE pair. Every further
+# WARP is a group of variables with its number, discovered rather than counted
+# (there is no limit):
+#
+#   WARP2_NAME=warp2            optional; defaults to the service name
+#   WARP2_PROXY=127.0.0.1:1081  "127.0.0.1:1081:1080" (docker's ports form) works too
+#   WARP2_SERVICE=warp2         the docker compose service to restart
+#   WARP2_COMPOSE_DIR / WARP2_COMPOSE_FILE   optional
+#
+# The functions below work on the "current" WARP (CUR_*), chosen with
+# select_warp, so probes and restarts are written once for any number of WARPs.
+# ---------------------------------------------------------------------------
+
+WARP_NAMES=()
+WARP_PROXIES=()
+WARP_SERVICES=()
+WARP_DIRS=()
+WARP_FILES=()
+CUR_NAME='' CUR_PROXY='' CUR_SERVICE='' CUR_DIR='' CUR_FILE=''
+CUR_STATE_FILE='' CUR_KEY_SUFFIX=''
+
+# 127.0.0.1:1081:1080 (docker's host:published:container) -> 127.0.0.1:1081
+normalize_proxy() {
+  local value="$1" parts=()
+  if [[ "${value}" != \[* ]]; then
+    IFS=: read -ra parts <<<"${value}"
+    if (( ${#parts[@]} == 3 )); then
+      value="${parts[0]}:${parts[1]}"
+    fi
+  fi
+  printf '%s' "${value}"
+}
+
+# Fills WARP_* from the environment. Dies on an inconsistent configuration.
+load_warps() {
+  local numbers=(1) var n i j
+  while IFS= read -r var; do
+    if [[ -n "${!var:-}" ]]; then
+      n="${var#WARP}"
+      numbers+=("${n%%_*}")
+    fi
+  done < <(compgen -A variable | grep -E '^WARP[0-9]+_(PROXY|SERVICE|NAME|COMPOSE_DIR|COMPOSE_FILE)$' || true)
+  mapfile -t numbers < <(printf '%s\n' "${numbers[@]}" | sort -un)
+
+  WARP_NAMES=() WARP_PROXIES=() WARP_SERVICES=() WARP_DIRS=() WARP_FILES=()
+  local proxy service name dir file p_var s_var n_var d_var f_var
+  for n in "${numbers[@]}"; do
+    p_var="WARP${n}_PROXY" s_var="WARP${n}_SERVICE" n_var="WARP${n}_NAME"
+    d_var="WARP${n}_COMPOSE_DIR" f_var="WARP${n}_COMPOSE_FILE"
+    proxy="${!p_var:-}" service="${!s_var:-}" name="${!n_var:-}"
+    dir="${!d_var:-}" file="${!f_var:-}"
+    if (( n == 1 )); then
+      proxy="${proxy:-${WARP_PROXY}}"
+      service="${service:-${COMPOSE_SERVICE}}"
+      name="${name:-${WARP_NAME}}"
+    fi
+    [[ -n "${proxy}" ]] || die "WARP${n}_PROXY is not set (WARP${n}_* variables exist)"
+    [[ -n "${service}" ]] || die "WARP${n}_SERVICE is not set: nothing to restart for WARP #${n}"
+    name="${name:-${service}}"
+    [[ "${name}" =~ ^[A-Za-z0-9._-]{1,32}$ ]] || die "WARP #${n}: name '${name}' must match [A-Za-z0-9._-]{1,32}"
+    WARP_NAMES+=("${name}")
+    WARP_PROXIES+=("$(normalize_proxy "${proxy}")")
+    WARP_SERVICES+=("${service}")
+    WARP_DIRS+=("${dir:-${COMPOSE_DIR}}")
+    WARP_FILES+=("${file:-${COMPOSE_FILE}}")
+  done
+
+  for (( i = 0; i < ${#WARP_NAMES[@]}; i++ )); do
+    for (( j = i + 1; j < ${#WARP_NAMES[@]}; j++ )); do
+      [[ "${WARP_NAMES[i]}" != "${WARP_NAMES[j]}" ]] || die "two WARPs share the name '${WARP_NAMES[i]}'"
+      [[ "${WARP_PROXIES[i]}" != "${WARP_PROXIES[j]}" ]] || die "two WARPs share the proxy '${WARP_PROXIES[i]}'"
+      [[ "${WARP_SERVICES[i]}" != "${WARP_SERVICES[j]}" ]] || die "two WARPs share the service '${WARP_SERVICES[i]}'"
+    done
+  done
+}
+
+# Makes WARP number $1 (0-based) the current one.
+select_warp() {
+  local i="$1"
+  CUR_NAME="${WARP_NAMES[i]}"
+  CUR_PROXY="${WARP_PROXIES[i]}"
+  CUR_SERVICE="${WARP_SERVICES[i]}"
+  CUR_DIR="${WARP_DIRS[i]}"
+  CUR_FILE="${WARP_FILES[i]}"
+  if (( i == 0 )); then
+    # WARP #1 keeps the file and alert names used before there were several.
+    CUR_STATE_FILE="${STATE_FILE}"
+    CUR_KEY_SUFFIX=''
+  else
+    CUR_STATE_FILE="${STATE_FILE}.${CUR_NAME}"
+    CUR_KEY_SUFFIX=".${CUR_NAME}"
+  fi
+  if (( ${#WARP_NAMES[@]} > 1 )) || [[ "${CUR_NAME}" != 'warp' ]]; then
+    CUR_WARP_TAG=" / ${CUR_NAME}"
+  else
+    CUR_WARP_TAG=''
+  fi
+}
+
+# Prints the 0-based index of the WARP called $1 (any case), or fails.
+find_warp() {
+  local wanted="${1,,}" i
+  for (( i = 0; i < ${#WARP_NAMES[@]}; i++ )); do
+    if [[ "${WARP_NAMES[i],,}" == "${wanted}" ]]; then
+      printf '%s' "${i}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# True if $1 is one of BAD_COUNTRIES.
+is_bad_country() {
+  local c="${1^^}" b
+  # Unquoted on purpose: split the list at spaces (commas became spaces).
+  # shellcheck disable=SC2086
+  for b in ${BAD_COUNTRIES//,/ }; do
+    if [[ "${b^^}" == "${c}" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Flag emoji for a two-letter country code (regional indicators, written as
+# UTF-8 bytes so it does not depend on the locale); the code itself otherwise.
+flag_of() {
+  local c="${1^^}"
+  if [[ "${c}" =~ ^[A-Z]{2}$ ]]; then
+    # U+1F1E6 + (letter - 'A') is F0 9F 87 (A6 + offset). The hex digits go into
+    # the format string, because printf resolves \x escapes before it formats.
+    local a b
+    a=$(printf '%02X' $(( 0xA6 + $(printf '%d' "'${c:0:1}") - 65 )))
+    b=$(printf '%02X' $(( 0xA6 + $(printf '%d' "'${c:1:1}") - 65 )))
+    # shellcheck disable=SC2059
+    printf "\\xF0\\x9F\\x87\\x${a}\\xF0\\x9F\\x87\\x${b}"
+  else
+    printf '❔'
+  fi
+}
+
+load_warps
+select_warp 0
+
 init_state() {
   mkdir -p "${STATE_DIR}"
   if [[ ! -f "${STATE_FILE}" ]]; then
@@ -123,7 +279,7 @@ tg_send() {
   local text="$1"
   tg_api sendMessage \
     -d "chat_id=${TG_CHAT_ID}" \
-    --data-urlencode "text=[<code>${NODE_NAME}</code>] ${text}" \
+    --data-urlencode "text=[<code>${NODE_NAME}${CUR_WARP_TAG}</code>] ${text}" \
     -d 'parse_mode=HTML' \
     -d 'disable_web_page_preview=true' >/dev/null
 }
@@ -135,7 +291,7 @@ tg_send_ok() {
   local reply
   reply=$(tg_api sendMessage \
     -d "chat_id=${TG_CHAT_ID}" \
-    --data-urlencode "text=[<code>${NODE_NAME}</code>] $1" \
+    --data-urlencode "text=[<code>${NODE_NAME}${CUR_WARP_TAG}</code>] $1" \
     -d 'parse_mode=HTML' \
     -d 'disable_web_page_preview=true')
   [[ "${reply}" == *'"ok":true'* ]]
@@ -146,7 +302,7 @@ tg_send_ok() {
 # be sent is retried on the next check instead of being lost; being on disk,
 # it also survives a restart of the bot.
 alert_raise() {
-  local key="$1" message="$2"
+  local key="$1${CUR_KEY_SUFFIX}" message="$2"
   if [[ -e "${ALERT_DIR}/${key}" ]]; then
     return 0
   fi
@@ -160,7 +316,7 @@ alert_raise() {
 # alert_clear KEY MESSAGE: report the recovery, but only if an alert for KEY
 # was raised before.
 alert_clear() {
-  local key="$1" message="$2"
+  local key="$1${CUR_KEY_SUFFIX}" message="$2"
   if [[ ! -e "${ALERT_DIR}/${key}" ]]; then
     return 0
   fi
@@ -177,7 +333,7 @@ alert_clear() {
 # Returns 0 if the WARP SOCKS5 proxy answers, non-zero otherwise.
 warp_alive() {
   curl -fs --max-time 8 \
-    --socks5-hostname "${WARP_PROXY}" \
+    --socks5-hostname "${CUR_PROXY}" \
     'https://cloudflare.com/cdn-cgi/trace' >/dev/null 2>&1
 }
 
@@ -185,7 +341,7 @@ warp_alive() {
 warp_exit_ip() {
   local trace
   trace=$(curl -s --max-time 8 \
-    --socks5-hostname "${WARP_PROXY}" \
+    --socks5-hostname "${CUR_PROXY}" \
     'https://cloudflare.com/cdn-cgi/trace' 2>/dev/null || true)
   grep -oP '^ip=\K.*' <<<"${trace}" | head -n1 || true
 }
@@ -194,7 +350,7 @@ warp_exit_ip() {
 warp_exit_country() {
   local trace
   trace=$(curl -s --max-time 8 \
-    --socks5-hostname "${WARP_PROXY}" \
+    --socks5-hostname "${CUR_PROXY}" \
     'https://cloudflare.com/cdn-cgi/trace' 2>/dev/null || true)
   grep -oP '^loc=\K[A-Z]{2}' <<<"${trace}" | head -n1 || true
 }
@@ -209,7 +365,7 @@ detect_google_country() {
     -A "${USER_AGENT}"
     -H "Cookie: ${GOOGLE_CONSENT_COOKIE}"
     -H 'Accept-Language: en-US,en;q=0.9'
-    --socks5-hostname "${WARP_PROXY}"
+    --socks5-hostname "${CUR_PROXY}"
   )
   local resp country=''
 
@@ -249,7 +405,7 @@ wait_for_warp() {
 # Composes a short post-restart report: new Google country + WARP exit IP.
 # Prints a Telegram-formatted string (no leading newline).
 post_restart_report() {
-  local country ip cloudflare_country
+  local previous_ip="${1:-}" country ip cloudflare_country
 
   if ! wait_for_warp; then
     printf '⚠️ WARP did not come up within %ss' "${WARP_BOOT_TIMEOUT}"
@@ -261,15 +417,20 @@ post_restart_report() {
   country=$(detect_google_country)
 
   local out=''
-  out+="Google now: <b>${country:-?}</b>"
+  out+="Google now: $(flag_of "${country}") <b>${country:-?}</b>"
   if [[ -n "${cloudflare_country}" ]]; then
-    out+=$'\n'"Cloudflare loc: <code>${cloudflare_country}</code>"
+    out+=$'\n'"Cloudflare loc: $(flag_of "${cloudflare_country}") <code>${cloudflare_country}</code>"
   fi
-  if [[ -n "${ip}" ]]; then
+  if [[ -n "${ip}" && -n "${previous_ip}" && "${ip}" != "${previous_ip}" ]]; then
+    out+=$'\n'"Exit IP: <code>${previous_ip}</code> → <code>${ip}</code>"
+  elif [[ -n "${ip}" ]]; then
     out+=$'\n'"Exit IP: <code>${ip}</code>"
+    if [[ "${ip}" == "${previous_ip}" ]]; then
+      out+=' (unchanged ⚠️)'
+    fi
   fi
-  if [[ "${country}" == 'RU' ]]; then
-    out+=$'\n'"🔴 still RU — try /restart again after cooldown"
+  if is_bad_country "${country}"; then
+    out+=$'\n'"🔴 still ${country} — try /restart again after cooldown"
   fi
   printf '%s' "${out}"
 }
@@ -279,8 +440,12 @@ post_restart_report() {
 # ---------------------------------------------------------------------------
 
 read_last_restart() {
-  local value
-  value=$(<"${STATE_FILE}") || value=0
+  local value=0
+  # A WARP that has never been restarted has no stamp file yet (only the first
+  # WARP's is created at start).
+  if [[ -r "${CUR_STATE_FILE}" ]]; then
+    value=$(<"${CUR_STATE_FILE}") || value=0
+  fi
   if [[ ! "${value}" =~ ^[0-9]+$ ]]; then
     value=0
   fi
@@ -305,23 +470,24 @@ restart_warp() {
     return "${EXIT_COOLDOWN}"
   fi
 
-  local cmd=(docker compose -f "${COMPOSE_DIR}/${COMPOSE_FILE}" restart)
-  if [[ -n "${COMPOSE_SERVICE}" ]]; then
-    cmd+=("${COMPOSE_SERVICE}")
-  fi
+  local cmd=(docker compose -f "${CUR_DIR}/${CUR_FILE}" restart "${CUR_SERVICE}")
 
   log "restarting warp: reason='${reason}'"
 
+  # The exit address before the restart, so the report can say "old -> new".
+  local previous_ip
+  previous_ip=$(warp_exit_ip)
+
   local output
   if output=$("${cmd[@]}" 2>&1); then
-    printf '%s\n' "${now}" >"${STATE_FILE}"
+    printf '%s\n' "${now}" >"${CUR_STATE_FILE}"
 
     local report
-    report=$(post_restart_report)
+    report=$(post_restart_report "${previous_ip}")
 
     tg_send "✅ WARP restarted
 Reason: <b>${reason}</b>
-Service: <code>${COMPOSE_SERVICE:-all}</code>
+Service: <code>${CUR_SERVICE}</code>
 
 ${report}"
     log 'restart ok'
@@ -344,14 +510,10 @@ Reason: <b>${reason}</b>
 
 last_check_ts=0
 
-scheduled_check() {
-  local now country rc
-  now=$(date +%s)
-
-  if (( now - last_check_ts < CHECK_INTERVAL )); then
-    return 0
-  fi
-  last_check_ts=${now}
+# One scheduled check of the current WARP: probe it, alert on outages, restart
+# it if Google sees one of BAD_COUNTRIES.
+check_current_warp() {
+  local country rc
 
   if ! warp_alive; then
     log 'WARP proxy unreachable'
@@ -370,14 +532,30 @@ scheduled_check() {
 
   log "check: Google=${country}"
 
-  if [[ "${country}" == 'RU' ]]; then
-    tg_send '🇷🇺 Google is detected as <b>RU</b> via WARP → restarting'
+  if is_bad_country "${country}"; then
+    tg_send "$(flag_of "${country}") Google is detected as <b>${country}</b> via WARP → restarting"
     rc=0
-    restart_warp 'auto: Google=RU' || rc=$?
+    restart_warp "auto: Google=${country}" || rc=$?
     if (( rc != EXIT_OK )); then
       log "auto restart returned ${rc}"
     fi
   fi
+}
+
+scheduled_check() {
+  local now i
+  now=$(date +%s)
+
+  if (( now - last_check_ts < CHECK_INTERVAL )); then
+    return 0
+  fi
+  last_check_ts=${now}
+
+  for (( i = 0; i < ${#WARP_NAMES[@]}; i++ )); do
+    select_warp "${i}"
+    check_current_warp
+  done
+  CUR_WARP_TAG=''
 }
 
 # ---------------------------------------------------------------------------
@@ -387,13 +565,13 @@ scheduled_check() {
 cmd_help() {
   tg_send "🤖 <b>WARP bot</b>
 
-/status  — current Google country and exit IP
+/status  — current Google country and exit IP, per WARP
 /check   — run a check right now
-/restart — restart WARP manually and report the new state
+/restart [warp] — restart WARP manually (every WARP, or the named one) and report the new state
 /help    — this message"
 }
 
-cmd_status() {
+status_current_warp() {
   if ! warp_alive; then
     tg_send '⚠️ WARP SOCKS5 is unreachable'
     return 0
@@ -404,9 +582,9 @@ cmd_status() {
   ip=$(warp_exit_ip)
   cloudflare_country=$(warp_exit_country)
 
-  local out="🌍 Google via WARP: <b>${country:-?}</b>"
+  local out="🌍 Google via WARP: $(flag_of "${country}") <b>${country:-?}</b>"
   if [[ -n "${cloudflare_country}" ]]; then
-    out+=$'\n'"Cloudflare loc: <code>${cloudflare_country}</code>"
+    out+=$'\n'"Cloudflare loc: $(flag_of "${cloudflare_country}") <code>${cloudflare_country}</code>"
   fi
   if [[ -n "${ip}" ]]; then
     out+=$'\n'"Exit IP: <code>${ip}</code>"
@@ -414,7 +592,15 @@ cmd_status() {
   tg_send "${out}"
 }
 
-cmd_check() {
+cmd_status() {
+  local i
+  for (( i = 0; i < ${#WARP_NAMES[@]}; i++ )); do
+    select_warp "${i}"
+    status_current_warp
+  done
+}
+
+check_current_warp_now() {
   if ! warp_alive; then
     tg_send '⚠️ WARP SOCKS5 is unreachable'
     return 0
@@ -427,35 +613,67 @@ cmd_check() {
     return 0
   fi
 
-  if [[ "${country}" != 'RU' ]]; then
-    cmd_status
+  if ! is_bad_country "${country}"; then
+    status_current_warp
     return 0
   fi
 
-  tg_send '🇷🇺 Google is detected as <b>RU</b> via WARP → restarting'
+  tg_send "$(flag_of "${country}") Google is detected as <b>${country}</b> via WARP → restarting"
   rc=0
-  restart_warp 'manual /check: Google=RU' || rc=$?
+  restart_warp "manual /check: Google=${country}" || rc=$?
   if (( rc == EXIT_COOLDOWN )); then
     tg_send '⏳ Restart skipped: cooldown active.'
   fi
 }
 
+cmd_check() {
+  local i
+  for (( i = 0; i < ${#WARP_NAMES[@]}; i++ )); do
+    select_warp "${i}"
+    check_current_warp_now
+  done
+}
+
+# /restart restarts every WARP; /restart <name> one of them.
 cmd_restart() {
-  local rc=0
-  restart_warp 'manual /restart' || rc=$?
-  if (( rc == EXIT_COOLDOWN )); then
-    tg_send '⏳ Restart skipped: cooldown active.'
+  local wanted="${1:-}" i rc
+  local indexes=()
+  if [[ -n "${wanted}" ]]; then
+    if ! i=$(find_warp "${wanted}"); then
+      CUR_WARP_TAG=''
+      tg_send "❓ Unknown WARP <code>${wanted//[<>&]/}</code>. Known: <code>${WARP_NAMES[*]}</code>"
+      return 0
+    fi
+    indexes=("${i}")
+  else
+    for (( i = 0; i < ${#WARP_NAMES[@]}; i++ )); do
+      indexes+=("${i}")
+    done
   fi
+
+  for i in "${indexes[@]}"; do
+    select_warp "${i}"
+    rc=0
+    restart_warp 'manual /restart' || rc=$?
+    if (( rc == EXIT_COOLDOWN )); then
+      tg_send '⏳ Restart skipped: cooldown active.'
+    fi
+  done
 }
 
 dispatch_command() {
-  case "$1" in
+  local cmd arg
+  read -r cmd arg _ <<<"$1"
+  cmd="${cmd%%@*}"
+  CUR_WARP_TAG=''
+  case "${cmd}" in
     /start | /help) cmd_help ;;
     /status)        cmd_status ;;
     /check)         cmd_check ;;
-    /restart)       cmd_restart ;;
+    /restart)       cmd_restart "${arg:-}" ;;
     *)              : ;;
   esac
+  CUR_WARP_TAG=''
 }
 
 # ---------------------------------------------------------------------------

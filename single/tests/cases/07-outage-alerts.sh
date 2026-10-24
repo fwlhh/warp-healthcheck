@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2317,SC2016
-# SC2317: warp_alive & co. are stand-ins called by the sourced script.
+# shellcheck disable=SC2317,SC2329,SC2034,SC2016
+# SC2317/SC2329: warp_alive & co. are stand-ins that the sourced script calls
+#   (SC2329 is the name newer shellcheck gives to "function never invoked").
+# SC2034: last_check_ts is a variable of the sourced script, set from here.
 # SC2016: the bash -c programs are meant to be single-quoted.
 #
 # A dead WARP proxy used to produce one log line and nothing else, and a broken

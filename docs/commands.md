@@ -4,9 +4,9 @@
 
 | Command    | Description                              |
 |------------|------------------------------------------|
-| `/status`  | Google country via WARP                  |
-| `/check`   | Run a check right now                    |
-| `/restart` | Restart WARP manually                    |
+| `/status`  | Google country via WARP (every WARP)     |
+| `/check`   | Run a check right now (every WARP)       |
+| `/restart [warp]` | Restart every WARP, or the named one |
 | `/help`    | Command list                             |
 
 ## Fleet mode
@@ -16,8 +16,9 @@
 | `/nodes`             | List every node with status              |
 | `/status`            | Same as `/nodes`                         |
 | `/status <node>`     | Details for one node                     |
-| `/restart <node>`    | Queue a restart for one node             |
-| `/restart all`       | Queue a restart for every node           |
+| `/restart <node>`    | Queue a restart for every WARP of the node |
+| `/restart <node> <warp>` | Restart one WARP of the node (name as in `/nodes`) |
+| `/restart all`       | Queue a restart for every WARP of every node |
 | `/logs <node>`       | Last command output for one node         |
 | `/help`              | Command list                             |
 

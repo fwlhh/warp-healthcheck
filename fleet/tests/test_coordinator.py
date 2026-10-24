@@ -512,7 +512,7 @@ class StaleNodeDisplayTest(CoordinatorTestCase):
         self.beat()
         C.cmd_status(self.NODE)
         self.assertIn("WARP: up", self.sent[-1])
-        self.assertIn("Google: 🇩🇪 DE", self.sent[-1])
+        self.assertIn("Google: 🇩🇪 Germany", self.sent[-1])
 
     def test_node_that_never_connected_is_labelled(self):
         self.assertIn("NEVER", self.list_nodes())
@@ -924,15 +924,15 @@ class RestartCardTest(CoordinatorTestCase):
                           "exit_ip": "2a09:bac5:4e32:c8::14:2bd"})
         (message,) = self.sent
         self.assertTrue(message.startswith("🟢 <b>n1</b> · restart #"))
-        self.assertIn("Google: 🇳🇱 NL", message)
-        self.assertIn("Cloudflare: 🇳🇱 NL", message)
+        self.assertIn("Google: 🇳🇱 Netherlands", message)
+        self.assertIn("Cloudflare: 🇳🇱 Netherlands", message)
         self.assertIn("Exit IP: <code>2a09:bac5:4e32:c8::14:2bd</code>", message)
 
     def test_still_ru_card_is_a_warning(self):
         self.post_result({"warp_up": True, "country": "RU", "still_ru": True})
         self.assertTrue(self.sent[0].startswith("🟡"))
         self.assertIn("still RU", self.sent[0])
-        self.assertIn("Google: 🇷🇺 RU", self.sent[0])
+        self.assertIn("Google: 🇷🇺 Russia", self.sent[0])
 
     def test_unknown_country_card(self):
         self.post_result({"warp_up": True, "country": ""})
@@ -976,6 +976,429 @@ class MessageHelpersTest(unittest.TestCase):
         self.assertEqual(C.tree(("A", "1"), None, ("B", "2")), ["├ A: 1", "└ B: 2"])
         self.assertEqual(C.tree(("A", "1")), ["└ A: 1"])
         self.assertEqual(C.tree(), [])
+
+
+class MultiWarpCoordinatorCase(CoordinatorTestCase):
+    """A node with several WARPs: the agent lists them in its heartbeat."""
+
+    def beat_warps(self, *specs, node=None, **top):
+        """specs: (name, google_country, alive) tuples."""
+        warps = [
+            {"name": n, "google_country": c, "alive": a, "last_restart": 0}
+            for n, c, a in specs
+        ]
+        body = {"warp_alive": all(a for _, _, a in specs), "google_country": specs[0][1], "warps": warps}
+        body.update(top)
+        headers = self.auth_headers() if node is None else node
+        return self.call("POST", "/heartbeat", body, headers=headers)
+
+    def commands(self, **where):
+        rows = self.sql("SELECT * FROM commands WHERE result_at IS NULL ORDER BY id")
+        return [(r["target"], r["id"]) for r in rows]
+
+    def warp_rows(self, node=None):
+        return self.sql("SELECT * FROM warps WHERE node = ? ORDER BY rowid", node or self.NODE)
+
+    def add_node(self, name):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            C.cli_add_node(name)
+        token = next(l.split("=", 1)[1] for l in out.getvalue().splitlines() if l.startswith("NODE_TOKEN="))
+        return {"X-Node": name, "X-Token": token, "Content-Type": "application/json"}
+
+
+class WarpHeartbeatTest(MultiWarpCoordinatorCase):
+    def test_the_warps_of_a_node_are_stored_in_the_agents_order(self):
+        self.beat_warps(("warp", "NL", True), ("warp2", "RU", True))
+        self.assertEqual([r["name"] for r in self.warp_rows()], ["warp", "warp2"])
+        self.assertEqual([r["google_country"] for r in self.warp_rows()], ["NL", "RU"])
+
+    def test_a_warp_that_disappears_is_forgotten_with_its_alert_state(self):
+        self.beat_warps(("warp", "NL", True), ("warp2", "RU", True))
+        C.meta_set(f"warp_alert:{self.NODE}:warp2", "down")
+        C.meta_set(f"retry_unknown:{self.NODE}:warp2", "1")
+        self.beat_warps(("warp", "NL", True))
+        self.assertEqual([r["name"] for r in self.warp_rows()], ["warp"])
+        self.assertEqual(C.meta_get(f"warp_alert:{self.NODE}:warp2", "gone"), "gone")
+        self.assertEqual(C.meta_get(f"retry_unknown:{self.NODE}:warp2", "gone"), "gone")
+
+    def test_garbage_in_the_list_is_dropped(self):
+        bad = ["x", 5, None, {"name": "bad name"}, {"name": "<b>"}, {"name": ""},
+               {"name": "dup"}, {"name": "dup"}, {"name": "ok", "google_country": "<a>", "alive": "yes"}]
+        self.call("POST", "/heartbeat", {"warp_alive": True, "warps": bad})
+        rows = self.warp_rows()
+        self.assertEqual([r["name"] for r in rows], ["dup", "ok"])
+        self.assertIsNone(rows[1]["google_country"])
+        self.assertEqual(rows[1]["warp_alive"], 0, "only JSON true counts as alive")
+
+    def test_the_list_is_capped(self):
+        many = [{"name": f"w{i}", "alive": True} for i in range(C.MAX_WARPS_PER_NODE + 40)]
+        self.call("POST", "/heartbeat", {"warp_alive": True, "warps": many})
+        self.assertEqual(len(self.warp_rows()), C.MAX_WARPS_PER_NODE)
+
+    def test_a_missing_or_invalid_list_does_not_wipe_what_is_known(self):
+        self.beat_warps(("warp", "NL", True), ("warp2", "DE", True))
+        for body in ({"warp_alive": True}, {"warp_alive": True, "warps": []},
+                     {"warp_alive": True, "warps": "oops"}, {"warp_alive": True, "warps": [5]}):
+            self.call("POST", "/heartbeat", body)
+        self.assertEqual(len(self.warp_rows()), 2)
+
+    def test_an_older_agent_without_a_list_has_one_implicit_warp(self):
+        self.call("POST", "/heartbeat", {"warp_alive": True, "google_country": "DE"})
+        row = self.sql("SELECT * FROM nodes WHERE name = ?", self.NODE)[0]
+        (w,) = C.node_warps(row)
+        self.assertEqual((w["name"], w["google_country"], w["warp_alive"]), ("warp", "DE", 1))
+        self.assertTrue(w["implicit"])
+
+
+class WarpRestartCommandTest(MultiWarpCoordinatorCase):
+    def setUp(self):
+        super().setUp()
+        self.beat_warps(("warp", "NL", True), ("warp2", "RU", True))
+
+    def test_restart_without_a_warp_covers_every_warp(self):
+        C.cmd_restart(self.NODE)
+        self.assertEqual([t for t, _ in self.commands()], ["warp", "warp2"])
+        message = self.sent[-1]
+        self.assertIn("restart queued", message)
+        self.assertIn("warp: #", message)
+        self.assertIn("warp2: #", message)
+
+    def test_restart_names_one_warp_in_any_case(self):
+        C.cmd_restart(self.NODE, "WARP2")
+        self.assertEqual([t for t, _ in self.commands()], ["warp2"])
+        self.assertIn("<b>n1 / warp2</b> · restart #", self.sent[-1])
+        self.assertIn("queued", self.sent[-1])
+
+    def test_unknown_warp_queues_nothing_and_lists_the_known_ones(self):
+        C.cmd_restart(self.NODE, "nope")
+        self.assertEqual(self.commands(), [])
+        self.assertIn("Unknown WARP", self.sent[-1])
+        self.assertIn("warp, warp2", self.sent[-1])
+
+    def test_pending_is_tracked_per_warp(self):
+        C.cmd_restart(self.NODE, "warp2")
+        C.cmd_restart(self.NODE, "warp2")
+        self.assertIn("already pending", self.sent[-1])
+        C.cmd_restart(self.NODE, "warp")           # the other one is free
+        self.assertEqual([t for t, _ in self.commands()], ["warp2", "warp"])
+        C.cmd_restart(self.NODE)                   # now both are pending
+        self.assertIn("nothing queued", self.sent[-1])
+        self.assertEqual(len(self.commands()), 2)
+
+    def test_the_agent_is_told_which_warp_to_restart(self):
+        C.cmd_restart(self.NODE, "warp2")
+        self.assertEqual(self.deliver(), [{"id": 1, "cmd": "restart", "warp": "warp2"}])
+
+    def test_telegram_syntax(self):
+        C.handle_command(f"/restart {self.NODE} warp2")
+        self.assertEqual([t for t, _ in self.commands()], ["warp2"])
+        C.handle_command("/restart")
+        self.assertIn("[warp]", self.sent[-1])
+        C.handle_command("/help")
+        self.assertIn("restart one WARP", self.sent[-1])
+
+    def test_restart_all_queues_one_command_per_warp_and_skips_silent_nodes(self):
+        other = self.add_node("n2")
+        self.beat_warps(("warp", "NL", True), node=other)       # one WARP
+        self.add_node("n3")                                      # never connected
+        C.cmd_restart_all()
+        self.assertEqual(sorted(t for t, _ in self.commands()), ["warp", "warp", "warp2"])
+        self.assertIn("2 nodes, 3 WARPs", self.sent[-1])
+        self.assertIn("<code>n3</code>: not reporting", self.sent[-1])
+
+    def test_a_node_with_an_older_agent_gets_a_bare_command(self):
+        other = self.add_node("old")
+        self.call("POST", "/heartbeat", {"warp_alive": True, "google_country": "DE"}, headers=other)
+        C.cmd_restart("old")
+        self.assertEqual(self.sql("SELECT target FROM commands")[0]["target"], "")
+        self.assertIn("⏳ <b>old</b> · restart #", self.sent[-1])  # no "/ warp" noise
+        C.cmd_restart("old")
+        self.assertIn("already pending", self.sent[-1])
+
+    def test_a_single_named_warp_keeps_its_name_in_messages(self):
+        other = self.add_node("solo")
+        self.beat_warps(("ams", "NL", True), node=other)
+        C.cmd_restart("solo")
+        self.assertIn("solo / ams", self.sent[-1])
+        C.cmd_restart("solo", "AMS")
+        self.assertIn("already pending", self.sent[-1])
+
+
+class WarpResultTest(MultiWarpCoordinatorCase):
+    def setUp(self):
+        super().setUp()
+        self.beat_warps(("warp", "NL", True), ("warp2", "RU", True))
+
+    def result(self, target, meta, ok=True, output=""):
+        C.cmd_restart(self.NODE, target)
+        (cmd,) = [c for c in self.deliver() if c["warp"] == target]
+        self.sent.clear()
+        return self.call("POST", "/result", {"id": cmd["id"], "ok": ok, "output": output, "meta": meta}), cmd["id"]
+
+    def test_the_card_names_node_and_warp(self):
+        _, cid = self.result("warp2", {"warp": "warp2", "warp_up": True, "country": "NL"})
+        self.assertTrue(self.sent[0].startswith(f"🟢 <b>n1 / warp2</b> · restart #{cid} · done"))
+
+    def test_only_that_warps_row_changes(self):
+        self.result("warp2", {"warp_up": True, "country": "NL"})
+        rows = {r["name"]: r for r in self.warp_rows()}
+        self.assertEqual((rows["warp2"]["google_country"], rows["warp"]["google_country"]), ("NL", "NL"))
+        self.assertGreater(rows["warp2"]["last_restart"], 0)
+        self.assertEqual(rows["warp"]["last_restart"], 0)
+        # the node's own (legacy summary) columns are left to the heartbeat
+        self.assertEqual(self.sql("SELECT google_country FROM nodes")[0]["google_country"], "NL")
+
+    def test_the_exit_address_change_is_shown(self):
+        self.result("warp2", {"warp_up": True, "country": "NL", "exit_ip": "2.2.2.2", "previous_ip": "1.1.1.1"})
+        self.assertIn("Exit IP: <code>1.1.1.1</code> → <code>2.2.2.2</code>", self.sent[0])
+
+    def test_an_unchanged_exit_address_is_flagged(self):
+        self.result("warp2", {"warp_up": True, "country": "NL", "exit_ip": "1.1.1.1", "previous_ip": "1.1.1.1"})
+        self.assertIn("<code>1.1.1.1</code> (unchanged ⚠️)", self.sent[0])
+
+    def test_without_a_previous_address_only_the_new_one_is_shown(self):
+        self.result("warp2", {"warp_up": True, "country": "NL", "exit_ip": "2.2.2.2"})
+        self.assertIn("Exit IP: <code>2.2.2.2</code>", self.sent[0])
+        self.assertNotIn("→", self.sent[0])
+
+    def test_a_cooldown_refusal_names_the_warp(self):
+        self.result("warp2", {"warp": "warp2", "skipped": "cooldown", "cooldown_remaining": 30}, ok=False)
+        self.assertIn("n1 / warp2", self.sent[0])
+        self.assertIn("skipped", self.sent[0])
+
+    def test_unknown_country_retries_that_warp_only(self):
+        with mock.patch.object(C, "RETRY_UNKNOWN_LIMIT", 3, create=True), mock.patch.object(
+            C, "RETRY_UNKNOWN_DELAY", 60, create=True
+        ):
+            self.result("warp2", {"warp_up": True, "country": ""})
+        self.assertEqual([t for t, _ in self.commands()], ["warp2"])
+        self.assertEqual(C.meta_get(f"retry_unknown:{self.NODE}:warp2"), "1")
+        self.assertEqual(C.meta_get(f"retry_unknown:{self.NODE}:warp", "none"), "none")
+        self.assertIn("n1 / warp2", self.sent[-1])
+
+    def test_a_known_country_clears_only_that_warps_retry_counter(self):
+        C.meta_set(f"retry_unknown:{self.NODE}:warp", "2")
+        C.meta_set(f"retry_unknown:{self.NODE}:warp2", "2")
+        self.result("warp2", {"warp_up": True, "country": "NL"})
+        self.assertEqual(C.meta_get(f"retry_unknown:{self.NODE}:warp2", "gone"), "gone")
+        self.assertEqual(C.meta_get(f"retry_unknown:{self.NODE}:warp"), "2")
+
+    def test_auto_restart_notice_names_the_warp(self):
+        self.call("POST", "/notify", {"reason": "auto", "warp": "warp2", "meta": {
+            "warp": "warp2", "warp_up": True, "country": "RU", "still_ru": True}})
+        self.assertTrue(self.sent[-1].startswith("🟡 <b>n1 / warp2</b> · auto-restart · still RU"))
+
+    def test_plain_notice_names_the_warp(self):
+        self.call("POST", "/notify", {"text": "auto-restart of warp2 failed: boom", "warp": "warp2"})
+        self.assertTrue(self.sent[-1].startswith("💬 <b>n1 / warp2</b>"))
+
+    def test_a_hostile_warp_name_is_not_trusted(self):
+        self.call("POST", "/notify", {"reason": "auto", "warp": '<a href="x">', "meta": {
+            "warp": "<b>", "warp_up": True, "country": "NL"}})
+        self.assertNotIn("<a href", self.sent[-1])
+        self.assertNotIn("<b>&lt;", self.sent[-1])
+
+
+class WarpDisplayTest(MultiWarpCoordinatorCase):
+    def test_nodes_lists_each_warp_with_its_own_state(self):
+        self.beat_warps(("warp", "NL", True), ("warp2", "RU", True))
+        C.cmd_nodes()
+        message = self.sent[-1]
+        self.assertIn("🟡 <code>n1</code>", message)           # the worst of its WARPs
+        self.assertIn("├ 🟢 warp · 🇳🇱 NL", message)
+        self.assertIn("└ 🟡 warp2 · 🇷🇺 RU", message)
+
+    def test_a_down_warp_makes_the_node_red(self):
+        self.beat_warps(("warp", "NL", True), ("warp2", "", False))
+        C.cmd_nodes()
+        self.assertIn("🔴 <code>n1</code>", self.sent[-1])
+        self.assertIn("└ 🔴 warp2 · WARP down", self.sent[-1])
+
+    def test_single_warp_nodes_keep_the_one_line_form(self):
+        self.beat_warps(("warp", "NL", True))
+        C.cmd_nodes()
+        self.assertIn("🟢 <code>n1</code> · 🇳🇱 NL", self.sent[-1])
+        self.assertNotIn("├", self.sent[-1])
+
+    def test_status_lists_every_warp(self):
+        self.beat_warps(("warp", "NL", True), ("warp2", "RU", True))
+        C.cmd_status(self.NODE)
+        message = self.sent[-1]
+        self.assertIn("warp: 🟢 🇳🇱 Netherlands", message)
+        self.assertIn("warp2: 🟡 🇷🇺 Russia", message)
+        self.assertIn("Heartbeat:", message)
+
+    def test_status_of_a_silent_node_does_not_vouch_for_its_warps(self):
+        self.beat_warps(("warp", "NL", True), ("warp2", "RU", True))
+        self.clock[0] += C.STALE_AFTER + 1
+        C.cmd_status(self.NODE)
+        self.assertIn("STALE", self.sent[-1])
+        self.assertIn("warp2: unknown (last report: 🇷🇺 Russia, up)", self.sent[-1])
+
+    def test_list_nodes_cli_shows_a_line_per_warp(self):
+        self.beat_warps(("warp", "NL", True), ("warp2", "RU", False))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            C.cli_list_nodes()
+        lines = out.getvalue().splitlines()
+        self.assertIn("WARP-DOWN", lines[0])
+        self.assertIn("warp2", lines[2])
+        self.assertIn("country=RU alive=no", lines[2])
+
+    def test_bad_countries_are_configurable(self):
+        self.beat_warps(("warp", "BY", True))
+        C.cmd_nodes()
+        self.assertIn("🟢", self.sent[-1])
+        with mock.patch.object(C, "BAD_COUNTRIES", frozenset({"RU", "BY"})):
+            C.cmd_nodes()
+        self.assertIn("🟡 <code>n1</code> · 🇧🇾 BY", self.sent[-1])
+        card = C._format_restart_message("n1", {"warp_up": True, "country": "BY"}, "restart #1")
+        self.assertIn("🟢", card)
+        with mock.patch.object(C, "BAD_COUNTRIES", frozenset({"BY"})):
+            card = C._format_restart_message("n1", {"warp_up": True, "country": "BY"}, "restart #1")
+        self.assertIn("still BY", card)
+
+    def test_health_counts_nodes_with_any_warp_down(self):
+        self.beat_warps(("warp", "NL", True), ("warp2", "", False))
+        _, body = self.call("GET", "/health", headers={})
+        self.assertEqual(body["nodes_warp_down"], 1)
+
+
+class WarpMonitorTest(MultiWarpCoordinatorCase):
+    def setUp(self):
+        super().setUp()
+        for name, value in {"_node_seen": {}, "_monitor_started": None}.items():
+            patcher = mock.patch.object(C, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def run_ticks(self, *steps):
+        sent = 0
+        for advance, specs in steps:
+            self.clock[0] += advance
+            self.beat_warps(*specs)
+            sent += C.node_monitor_tick()
+        return sent
+
+    UP = (("warp", "NL", True), ("warp2", "NL", True))
+    DOWN2 = (("warp", "NL", True), ("warp2", "", False))
+
+    def test_a_down_warp_is_named_once(self):
+        d = C.WARP_DOWN_ALERT_AFTER
+        self.run_ticks((0, self.UP), (0, self.DOWN2))
+        self.assertEqual(self.run_ticks((d, self.DOWN2)), 1)
+        self.assertIn("<b>n1 / warp2</b> · WARP is down", self.sent[-1])
+        self.assertEqual(self.run_ticks((30, self.DOWN2), (30, self.DOWN2)), 0)
+
+    def test_the_other_warp_is_not_blamed_and_recovery_is_per_warp(self):
+        d = C.WARP_DOWN_ALERT_AFTER
+        self.run_ticks((0, self.UP), (0, self.DOWN2), (d, self.DOWN2))
+        self.assertEqual(self.run_ticks((10, self.UP)), 1)
+        self.assertIn("<b>n1 / warp2</b> · WARP is back", self.sent[-1])
+        self.assertEqual(len(self.sent), 2)
+        self.assertTrue(all("n1 / warp</b>" not in m for m in self.sent))
+
+    def test_two_warps_down_make_two_alerts(self):
+        d = C.WARP_DOWN_ALERT_AFTER
+        both = (("warp", "", False), ("warp2", "", False))
+        self.run_ticks((0, self.UP), (0, both))
+        self.assertEqual(self.run_ticks((d, both)), 2)
+        self.assertEqual({"n1 / warp", "n1 / warp2"}, {
+            m.split("<b>")[1].split("</b>")[0] for m in self.sent})
+
+    def test_a_silent_node_is_one_alert_not_one_per_warp(self):
+        self.run_ticks((0, self.UP))
+        self.clock[0] += C.STALE_AFTER + 1
+        self.assertEqual(C.node_monitor_tick(), 1)
+        self.assertIn("stopped reporting", self.sent[-1])
+        self.assertEqual(C.node_monitor_tick(), 0)
+
+    def test_a_warp_that_was_down_before_the_upgrade_is_not_announced_twice(self):
+        self.run_ticks((0, self.UP))
+        C.meta_set(f"node_alert:{self.NODE}", "warp_down")  # what the previous version stored
+        self.run_ticks((0, (("warp", "", False),)), (C.WARP_DOWN_ALERT_AFTER, (("warp", "", False),)))
+        self.assertEqual(self.sent, [])
+        self.assertEqual(C.meta_get(f"node_alert:{self.NODE}"), "ok")
+
+    def test_remove_node_forgets_per_warp_state_and_only_its_own(self):
+        other = self.add_node("n1x")
+        self.beat_warps(*self.UP)
+        self.beat_warps(*self.UP, node=other)
+        for node in (self.NODE, "n1x"):
+            C.meta_set(f"warp_alert:{node}:warp2", "down")
+            C.meta_set(f"retry_unknown:{node}:warp2", "1")
+        with contextlib.redirect_stdout(io.StringIO()):
+            C.cli_remove_node(self.NODE)
+        self.assertEqual(self.warp_rows(), [])
+        self.assertEqual(C.meta_get(f"warp_alert:{self.NODE}:warp2", "gone"), "gone")
+        self.assertEqual(C.meta_get(f"retry_unknown:{self.NODE}:warp2", "gone"), "gone")
+        self.assertEqual(C.meta_get("warp_alert:n1x:warp2"), "down", "another node's state was deleted")
+        self.assertEqual(len(self.warp_rows("n1x")), 2)
+
+    def test_underscore_in_a_node_name_is_not_a_wildcard(self):
+        a = self.add_node("a_b")
+        x = self.add_node("axb")
+        C.meta_set("warp_alert:axb:warp", "down")
+        with contextlib.redirect_stdout(io.StringIO()):
+            C.cli_remove_node("a_b")
+        self.assertEqual(C.meta_get("warp_alert:axb:warp"), "down")
+
+
+class CountryDisplayTest(unittest.TestCase):
+    def test_names_and_flags_for_the_usual_countries(self):
+        for code, name in {"NL": "Netherlands", "DE": "Germany", "US": "United States",
+                           "GB": "United Kingdom", "FR": "France", "JP": "Japan", "RU": "Russia"}.items():
+            self.assertEqual(C.place(code, full=True), f"{C.flag(code)} {name}")
+        self.assertEqual(C.place("nl"), "🇳🇱 NL")
+
+    def test_a_valid_code_without_a_name_still_shows_flag_and_code(self):
+        self.assertEqual(C.place("XQ", full=True), "🇽🇶 XQ")
+        self.assertEqual(C.place("XQ"), "🇽🇶 XQ")
+
+    def test_new_names_can_be_added_by_configuration(self):
+        extra = C._extra_country_names("XK=Kosovo; AQ = Antarctica ,bad,=x,ZZZ=no,1A=no,NL=Holland")
+        self.assertEqual(extra, {"XK": "Kosovo", "AQ": "Antarctica", "NL": "Holland"})
+        with mock.patch.object(C, "COUNTRY_NAMES", {**C.COUNTRY_NAMES, **extra}):
+            self.assertEqual(C.place("xk", full=True), "🇽🇰 Kosovo")
+            self.assertEqual(C.place("NL", full=True), "🇳🇱 Holland")
+
+    def test_special_codes_and_aliases(self):
+        self.assertEqual(C.place("T1", full=True), "🧅 Tor")
+        self.assertEqual(C.place("UK", full=True), "🇬🇧 United Kingdom")
+        self.assertEqual(C.clean_country("T1"), "T1")
+
+    def test_garbage_is_never_echoed(self):
+        for bad in ("", None, 5, "N", "NLD", "1x", '<a href="x">', "é\u00e9", "XX1"):
+            self.assertEqual(C.place(bad, full=True), "❔ unknown", bad)
+
+
+def fresh_coordinator(**env):
+    saved = dict(os.environ)
+    try:
+        for key in ("BAD_COUNTRIES", "COUNTRY_NAMES"):
+            os.environ.pop(key, None)
+        os.environ.update(env)
+        spec = importlib.util.spec_from_file_location("warp_coordinator_fresh", ROOT / "fleet" / "coordinator" / "coordinator.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+
+
+class CoordinatorEnvConfigTest(unittest.TestCase):
+    def test_bad_countries(self):
+        self.assertEqual(fresh_coordinator().BAD_COUNTRIES, frozenset({"RU"}))
+        self.assertEqual(fresh_coordinator(BAD_COUNTRIES="ru,by").BAD_COUNTRIES, frozenset({"RU", "BY"}))
+        self.assertEqual(fresh_coordinator(BAD_COUNTRIES="").BAD_COUNTRIES, frozenset())
+
+    def test_extra_country_names_come_from_the_environment(self):
+        mod = fresh_coordinator(COUNTRY_NAMES="XK=Kosovo,NL=Holland")
+        self.assertEqual(mod.place("xk", full=True), "🇽🇰 Kosovo")
+        self.assertEqual(mod.place("NL", full=True), "🇳🇱 Holland")
+        self.assertEqual(mod.place("DE", full=True), "🇩🇪 Germany")
 
 
 if __name__ == "__main__":

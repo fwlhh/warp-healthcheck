@@ -100,3 +100,18 @@ If you later switch the agent to `docker exec warp warp-cli ...` and
 find the sandbox blocks it, add `ProtectSystem=strict` with
 `ReadWritePaths=` for the docker socket directory. The current design
 does not need that.
+
+## Prior art
+
+A few ideas came from reading how other projects treat a proxy exit; each was
+written from scratch for this code base, and no code or text was copied:
+
+* showing the exit address before and after a restart, so it is visible whether
+  the restart moved it (from [vps-psiphon](https://github.com/Chara-Freedom/vps-psiphon),
+  MIT licensed);
+* a configurable list of countries that count as "bad" (`BAD_COUNTRIES`),
+  instead of one hard-coded country (the same project);
+* a command-line `status` that probes every WARP once (`warp-agent status`).
+
+Ideas and algorithms are not protected by copyright. Should code from such a
+project ever be copied here, its licence notice has to be kept with it.

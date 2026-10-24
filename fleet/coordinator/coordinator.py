@@ -80,6 +80,12 @@ LEASE_EXPIRED_OUTPUT = "lease expired after max attempts"
 MAX_BODY_BYTES = 64 * 1024
 HTTP_SOCKET_TIMEOUT = int(env("HTTP_SOCKET_TIMEOUT", "30"))
 LOG_LEVEL = env("LOG_LEVEL", "INFO").upper()
+# Countries where Google refuses the service; shown as a warning (🟡) in /nodes
+# and /status. Use the same value as the agents' BAD_COUNTRIES.
+BAD_COUNTRIES = frozenset(env("BAD_COUNTRIES", "RU").replace(",", " ").upper().split())
+# The name a node's only WARP gets when its agent does not report a list.
+DEFAULT_WARP = "warp"
+MAX_WARPS_PER_NODE = 64
 
 TG_TOKEN = ""
 TG_CHAT_ID = 0
@@ -150,6 +156,8 @@ def _migrate_commands(conn):
         ("output", "TEXT"),
         ("result_at", "INTEGER"),
         ("not_before", "INTEGER NOT NULL DEFAULT 0"),
+        # Which WARP of the node a command is for; '' = the whole node.
+        ("target", "TEXT NOT NULL DEFAULT ''"),
     ]
     for name, typ in additions:
         if name not in cols:
@@ -263,7 +271,17 @@ def db_init() -> None:
                 ok           INTEGER,
                 output       TEXT,
                 result_at    INTEGER,
-                not_before   INTEGER NOT NULL DEFAULT 0
+                not_before   INTEGER NOT NULL DEFAULT 0,
+                target       TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS warps (
+                node           TEXT NOT NULL,
+                name           TEXT NOT NULL,
+                google_country TEXT,
+                warp_alive     INTEGER NOT NULL DEFAULT 0,
+                last_restart   INTEGER NOT NULL DEFAULT 0,
+                updated_at     INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (node, name)
             );
             CREATE INDEX IF NOT EXISTS idx_commands_pending
                 ON commands(node, result_at, delivered_at);
@@ -381,20 +399,62 @@ def fmt_dur(sec):
     return f"{sec // 86400}d"
 
 
-def node_state(row, t):
+def node_state(row, t, warps=None):
     """Judge a node from its last heartbeat: 'never', 'stale', 'warp_down', 'ok'.
 
     The stored warp_alive / google_country are only the node's *last report*.
     Once heartbeats stop they say nothing about the present, so every view of
-    a node (Telegram, CLI, alerts) must go through this check first.
+    a node (Telegram, CLI, alerts) must go through this check first. With
+    `warps` (see node_warps) a node is 'warp_down' when any of them is down.
     """
     if not row["last_heartbeat"]:
         return "never"
     if t - row["last_heartbeat"] > STALE_AFTER:
         return "stale"
-    if not row["warp_alive"]:
-        return "warp_down"
-    return "ok"
+    if warps is not None:
+        down = any(not w["warp_alive"] for w in warps)
+    else:
+        down = not row["warp_alive"]
+    return "warp_down" if down else "ok"
+
+
+def node_warps(row, conn=None):
+    """The WARPs a node reported, in the order its agent lists them.
+
+    A node whose agent does not report a list (an older agent) has one
+    implicit WARP, built from the node's own columns, so every view can treat
+    all nodes alike.
+    """
+    own = conn is None
+    conn = conn or db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM warps WHERE node = ? ORDER BY rowid", (row["name"],)
+        ).fetchall()
+    finally:
+        if own:
+            conn.close()
+    if rows:
+        return [dict(r) for r in rows]
+    return [
+        {
+            "node": row["name"],
+            "name": DEFAULT_WARP,
+            "google_country": row["google_country"],
+            "warp_alive": row["warp_alive"],
+            "last_restart": row["last_restart"],
+            "updated_at": row["last_heartbeat"],
+            "implicit": True,
+        }
+    ]
+
+
+def warp_label(node, warp_name, multi):
+    """'NE01 / warp2'. The WARP is left out when it is the node's only one and
+    has the default name: there is nothing to tell apart."""
+    if warp_name and (multi or warp_name != DEFAULT_WARP):
+        return f"{node} / {warp_name}"
+    return node
 
 
 def esc(s):
@@ -408,18 +468,78 @@ def esc(s):
 # ---------------------------------------------------------------------------
 
 
+# Names for the countries seen in practice. Any other valid ISO code still gets
+# its flag and its code; add names with COUNTRY_NAMES="XK=Kosovo,AQ=Antarctica".
+_COUNTRY_NAMES = {
+    "AD": "Andorra", "AE": "United Arab Emirates", "AL": "Albania", "AM": "Armenia",
+    "AR": "Argentina", "AT": "Austria", "AU": "Australia", "AZ": "Azerbaijan",
+    "BA": "Bosnia and Herzegovina", "BD": "Bangladesh", "BE": "Belgium", "BG": "Bulgaria",
+    "BH": "Bahrain", "BR": "Brazil", "BY": "Belarus", "CA": "Canada", "CH": "Switzerland",
+    "CL": "Chile", "CN": "China", "CO": "Colombia", "CR": "Costa Rica", "CU": "Cuba",
+    "CY": "Cyprus", "CZ": "Czechia", "DE": "Germany", "DK": "Denmark", "DZ": "Algeria",
+    "EE": "Estonia", "EG": "Egypt", "ES": "Spain", "FI": "Finland", "FR": "France",
+    "GB": "United Kingdom", "GE": "Georgia", "GR": "Greece", "HK": "Hong Kong",
+    "HR": "Croatia", "HU": "Hungary", "ID": "Indonesia", "IE": "Ireland", "IL": "Israel",
+    "IN": "India", "IQ": "Iraq", "IR": "Iran", "IS": "Iceland", "IT": "Italy",
+    "JP": "Japan", "KE": "Kenya", "KG": "Kyrgyzstan", "KP": "North Korea",
+    "KR": "South Korea", "KW": "Kuwait", "KZ": "Kazakhstan", "LI": "Liechtenstein",
+    "LT": "Lithuania", "LU": "Luxembourg", "LV": "Latvia", "MA": "Morocco",
+    "MC": "Monaco", "MD": "Moldova", "ME": "Montenegro", "MK": "North Macedonia",
+    "MT": "Malta", "MX": "Mexico", "MY": "Malaysia", "NG": "Nigeria", "NL": "Netherlands",
+    "NO": "Norway", "NZ": "New Zealand", "PE": "Peru", "PH": "Philippines",
+    "PK": "Pakistan", "PL": "Poland", "PT": "Portugal", "QA": "Qatar", "RO": "Romania",
+    "RS": "Serbia", "RU": "Russia", "SA": "Saudi Arabia", "SE": "Sweden", "SG": "Singapore",
+    "SI": "Slovenia", "SK": "Slovakia", "SY": "Syria", "TH": "Thailand", "TR": "Turkey",
+    "TW": "Taiwan", "UA": "Ukraine", "US": "United States", "UZ": "Uzbekistan",
+    "VE": "Venezuela", "VN": "Vietnam", "ZA": "South Africa", "EU": "European Union",
+}
+# Codes that are not countries but do occur: Cloudflare reports Tor as T1.
+_SPECIAL_PLACES = {"T1": ("🧅", "Tor")}
+_COUNTRY_ALIASES = {"UK": "GB"}
+
+
+def _extra_country_names(spec):
+    names = {}
+    for part in spec.replace(";", ",").split(","):
+        code, sep, name = part.partition("=")
+        code, name = code.strip().upper(), name.strip()
+        if sep and name and len(code) == 2 and code.isascii() and code.isalpha():
+            names[code] = name
+    return names
+
+
+COUNTRY_NAMES = {**_COUNTRY_NAMES, **_extra_country_names(env("COUNTRY_NAMES", ""))}
+
+
+def _norm_cc(cc):
+    if not isinstance(cc, str):
+        return ""
+    cc = cc.strip().upper()
+    return _COUNTRY_ALIASES.get(cc, cc)
+
+
 def flag(cc):
-    """Flag emoji for a two-letter country code, or '❔' when it is not one."""
-    cc = (cc or "").strip().upper() if isinstance(cc, str) else ""
+    """Flag emoji for a country code (any valid ISO 3166 code), or '❔'."""
+    cc = _norm_cc(cc)
+    if cc in _SPECIAL_PLACES:
+        return _SPECIAL_PLACES[cc][0]
     if len(cc) == 2 and cc.isascii() and cc.isalpha():
         return "".join(chr(0x1F1E6 + ord(c) - ord("A")) for c in cc)
     return "❔"
 
 
-def place(cc):
-    """'🇳🇱 NL' for a valid code, '❔ unknown' for anything else."""
+def place(cc, full=False):
+    """'🇳🇱 NL', or '🇳🇱 Netherlands' with full=True when the name is known.
+    Anything that is not a valid code is '❔ unknown', never echoed."""
+    cc = _norm_cc(cc)
     f = flag(cc)
-    return "❔ unknown" if f == "❔" else f"{f} {cc.strip().upper()}"
+    if f == "❔":
+        return "❔ unknown"
+    if full:
+        name = COUNTRY_NAMES.get(cc) or (_SPECIAL_PLACES.get(cc) or ("", ""))[1]
+        if name:
+            return f"{f} {name}"
+    return f"{f} {cc}"
 
 
 def tree(*rows):
@@ -442,7 +562,7 @@ def card(icon, name, what, *rows):
 
 # Same alphabet as NODE_NAME in single/bin/warp-bot.sh.
 NODE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
-_COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
+_COUNTRY_RE = re.compile(r"^([A-Z]{2}|T1)$")  # T1: Cloudflare's code for Tor
 _IP_RE = re.compile(r"^[0-9A-Fa-f:.]{1,45}$")
 
 
@@ -452,6 +572,55 @@ def clean_country(value):
         return ""
     value = value.strip().upper()
     return value if _COUNTRY_RE.match(value) else ""
+
+
+def clean_warps(raw):
+    """Validate the per-WARP list of a heartbeat: at most MAX_WARPS_PER_NODE
+    entries, valid unique names, checked fields. Anything else is dropped."""
+    if not isinstance(raw, list):
+        return []
+    out, seen = [], set()
+    for item in raw[:MAX_WARPS_PER_NODE]:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not NODE_NAME_RE.match(name) or name in seen:
+            continue
+        seen.add(name)
+        out.append(
+            {
+                "name": name,
+                "google_country": clean_country(item.get("google_country")) or None,
+                "alive": item.get("alive") is True,
+                "last_restart": clean_ts(item.get("last_restart")),
+            }
+        )
+    return out
+
+
+def sync_warps(conn, node, warps, t):
+    """Make the stored WARPs of a node match the list its agent reports."""
+    for w in warps:
+        conn.execute(
+            "INSERT INTO warps (node, name, google_country, warp_alive, last_restart, "
+            "updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(node, name) DO UPDATE SET google_country = excluded.google_country, "
+            "warp_alive = excluded.warp_alive, last_restart = excluded.last_restart, "
+            "updated_at = excluded.updated_at",
+            (node, w["name"], w["google_country"], 1 if w["alive"] else 0, w["last_restart"], t),
+        )
+    names = [w["name"] for w in warps]
+    marks = ",".join("?" * len(names))
+    gone = [
+        r["name"]
+        for r in conn.execute(
+            f"SELECT name FROM warps WHERE node = ? AND name NOT IN ({marks})", (node, *names)
+        )
+    ]
+    for name in gone:  # a WARP removed from the node: forget it and its alerts
+        conn.execute("DELETE FROM warps WHERE node = ? AND name = ?", (node, name))
+        conn.execute("DELETE FROM meta WHERE key = ?", (f"warp_alert:{node}:{name}",))
+        conn.execute("DELETE FROM meta WHERE key = ?", (f"retry_unknown:{node}:{name}",))
 
 
 def clean_ts(value):
@@ -473,8 +642,12 @@ def clean_meta(raw):
     if not isinstance(raw, dict):
         return {}
     ip = raw.get("exit_ip")
+    previous = raw.get("previous_ip")
+    warp = raw.get("warp")
     remaining = raw.get("cooldown_remaining")
     return {
+        "warp": warp if isinstance(warp, str) and NODE_NAME_RE.match(warp) else "",
+        "previous_ip": previous if isinstance(previous, str) and _IP_RE.match(previous) else "",
         # The agent refused a restart because its cooldown is active.
         "skipped": "cooldown" if raw.get("skipped") == "cooldown" else "",
         "cooldown_remaining": (
@@ -511,18 +684,22 @@ def _format_restart_message(name, meta, kind, ok=True, output=""):
         return card("🔴", name, f"{kind} · WARP did not come up")
 
     country = (meta.get("country") or "").strip().upper()
-    if meta.get("still_ru") or country == "RU":
-        icon, what = "🟡", f"{kind} · still RU"
+    if meta.get("still_ru") or country in BAD_COUNTRIES:
+        icon, what = "🟡", f"{kind} · still {country or 'blocked'}"
     elif country:
         icon, what = "🟢", f"{kind} · done"
     else:
         icon, what = "🟡", f"{kind} · country unknown"
 
-    rows = [("Google", place(country))]
+    rows = [("Google", place(country, full=True))]
     if meta.get("cloudflare_loc"):
-        rows.append(("Cloudflare", place(meta["cloudflare_loc"])))
-    if meta.get("exit_ip"):
-        rows.append(("Exit IP", f"<code>{esc(meta['exit_ip'])}</code>"))
+        rows.append(("Cloudflare", place(meta["cloudflare_loc"], full=True)))
+    ip, before = meta.get("exit_ip"), meta.get("previous_ip")
+    if ip and before and ip != before:
+        rows.append(("Exit IP", f"<code>{esc(before)}</code> → <code>{esc(ip)}</code>"))
+    elif ip:
+        same = " (unchanged ⚠️)" if before == ip else ""
+        rows.append(("Exit IP", f"<code>{esc(ip)}</code>{same}"))
     return card(icon, name, what, *rows)
 
 
@@ -531,46 +708,82 @@ def _format_restart_message(name, meta, kind, ok=True, output=""):
 # ===========================================================================
 
 
-def _apply_meta_to_node(name, meta):
-    """Update the node's stored country and last_restart from a report."""
+def _warp_count(conn, node):
+    """How many WARPs the node reported (0: its agent reports no list)."""
+    return conn.execute("SELECT COUNT(*) AS c FROM warps WHERE node = ?", (node,)).fetchone()["c"]
+
+
+def _pending_restart(conn, node, target):
+    """Is a restart for this target already waiting? A command for the whole
+    node ('') overlaps with every WARP, and the other way round."""
+    if target:
+        row = conn.execute(
+            "SELECT id FROM commands WHERE node = ? AND command = 'restart' "
+            "AND result_at IS NULL AND target IN (?, '') LIMIT 1",
+            (node, target),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT id FROM commands WHERE node = ? AND command = 'restart' "
+            "AND result_at IS NULL LIMIT 1",
+            (node,),
+        ).fetchone()
+    return row is not None
+
+
+def _retry_key(node, warp):
+    return f"retry_unknown:{node}:{warp}" if warp else f"retry_unknown:{node}"
+
+
+def _apply_meta_to_node(name, meta, warp=""):
+    """Update the stored country and last_restart from a restart report.
+
+    `warp` names the WARP the report is about. The node's own columns hold the
+    legacy single-WARP summary and are only touched for a node with at most
+    one WARP; with several, the agent's next heartbeat (sent right after every
+    restart) refreshes them.
+    """
     country = (meta.get("country") or "").strip()
     if not country or country == "?":
         return
     conn = db_connect()
     try:
-        conn.execute(
-            "UPDATE nodes SET google_country = ?, last_restart = ? WHERE name = ?",
-            (country, now(), name),
-        )
-        conn.execute("DELETE FROM meta WHERE key = ?", (f"retry_unknown:{name}",))
+        if warp:
+            conn.execute(
+                "UPDATE warps SET google_country = ?, last_restart = ?, warp_alive = 1, "
+                "updated_at = ? WHERE node = ? AND name = ?",
+                (country, now(), now(), name, warp),
+            )
+        if _warp_count(conn, name) <= 1:
+            conn.execute(
+                "UPDATE nodes SET google_country = ?, last_restart = ? WHERE name = ?",
+                (country, now(), name),
+            )
+        conn.execute("DELETE FROM meta WHERE key = ?", (_retry_key(name, warp),))
     finally:
         conn.close()
 
 
-def _schedule_unknown_retry(name):
+def _schedule_unknown_retry(name, warp=""):
     """Queue a delayed restart if the last one ended with country == '?'."""
     if RETRY_UNKNOWN_LIMIT <= 0:
         return
-    key = f"retry_unknown:{name}"
+    key = _retry_key(name, warp)
     conn = db_connect()
     try:
-        pending = conn.execute(
-            "SELECT id FROM commands WHERE node = ? AND command = 'restart' "
-            "AND result_at IS NULL LIMIT 1",
-            (name,),
-        ).fetchone()
-        if pending:
+        if _pending_restart(conn, name, warp):
             return
+        label = warp_label(name, warp, _warp_count(conn, name) > 1)
         row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         count = int(row["value"]) if row else 0
 
         if count >= RETRY_UNKNOWN_LIMIT:
             conn.execute("DELETE FROM meta WHERE key = ?", (key,))
-            log("WARN", f"{name}: gave up after {RETRY_UNKNOWN_LIMIT} retries")
+            log("WARN", f"{label}: gave up after {RETRY_UNKNOWN_LIMIT} retries")
             tg_send(
                 card(
                     "⚠️",
-                    name,
+                    label,
                     "giving up",
                     (
                         "Google country",
@@ -588,17 +801,17 @@ def _schedule_unknown_retry(name):
         )
         t = now()
         conn.execute(
-            "INSERT INTO commands (node, command, created_at, not_before) "
-            "VALUES (?, 'restart', ?, ?)",
-            (name, t, t + RETRY_UNKNOWN_DELAY),
+            "INSERT INTO commands (node, command, created_at, not_before, target) "
+            "VALUES (?, 'restart', ?, ?, ?)",
+            (name, t, t + RETRY_UNKNOWN_DELAY, warp),
         )
     finally:
         conn.close()
-    log("INFO", f"{name}: queued retry #{count} in {RETRY_UNKNOWN_DELAY}s")
+    log("INFO", f"{label}: queued retry #{count} in {RETRY_UNKNOWN_DELAY}s")
     tg_send(
         card(
             "🔁",
-            name,
+            label,
             "country still unknown",
             ("Retry", f"#{count}/{RETRY_UNKNOWN_LIMIT} in {fmt_dur(RETRY_UNKNOWN_DELAY)}"),
         )
@@ -613,7 +826,8 @@ HELP_TEXT = (
     "<b>warp-coordinator</b>\n\n"
     "/nodes              — list nodes\n"
     "/status &lt;node&gt;     — details for one node\n"
-    "/restart &lt;node&gt;    — queue restart\n"
+    "/restart &lt;node&gt;    — queue restart (all WARPs of the node)\n"
+    "/restart &lt;node&gt; &lt;warp&gt; — restart one WARP\n"
     "/restart all        — queue restart for every node\n"
     "/logs &lt;node&gt;       — last command output\n"
     "/health             — coordinator health\n"
@@ -621,34 +835,57 @@ HELP_TEXT = (
 )
 
 
+def _warp_icon(w):
+    """🔴 down, 🟡 in a country Google refuses, 🟢 fine (for a fresh report)."""
+    if not w["warp_alive"]:
+        return "🔴"
+    return "🟡" if (w["google_country"] or "").upper() in BAD_COUNTRIES else "🟢"
+
+
+def _warp_detail(w, t, full=False):
+    if not w["warp_alive"]:
+        return "WARP down"
+    country = (w["google_country"] or "").upper()
+    detail = place(country, full=full)
+    if country in BAD_COUNTRIES and w["last_restart"]:
+        detail += f" · restarted {fmt_dur(t - w['last_restart'])} ago"
+    return detail
+
+
+def _worst_icon(icons):
+    return "🔴" if "🔴" in icons else ("🟡" if "🟡" in icons else "🟢")
+
+
 def cmd_nodes():
     conn = db_connect()
     try:
         rows = conn.execute("SELECT * FROM nodes ORDER BY name").fetchall()
+        data = [(r, node_warps(r, conn)) for r in rows]
     finally:
         conn.close()
-    if not rows:
+    if not data:
         tg_send("🛰 <b>Nodes</b>\n\nNo nodes registered.")
         return
     t = now()
     lines = []
-    for r in rows:
-        state = node_state(r, t)
-        name = f"<code>{esc(r['name'])}</code>"
-        country = (r["google_country"] or "").upper()
+    for r, warps in data:
+        state = node_state(r, t, warps)
+        name = r["name"]
         if state == "never":
-            icon, detail = "⚫", "never connected"
+            lines.append(f"⚫ <code>{esc(name)}</code> · never connected")
         elif state == "stale":
-            icon, detail = "⚫", f"silent {fmt_dur(t - r['last_heartbeat'])}"
-        elif state == "warp_down":
-            icon, detail = "🔴", "WARP down"
-        elif country == "RU":
-            icon, detail = "🟡", place(country)
-            if r["last_restart"]:
-                detail += f" · restarted {fmt_dur(t - r['last_restart'])} ago"
+            age = fmt_dur(t - r["last_heartbeat"])
+            lines.append(f"⚫ <code>{esc(name)}</code> · silent {age}")
+        elif len(warps) == 1:
+            w = warps[0]
+            label = warp_label(name, w["name"], False)
+            lines.append(f"{_warp_icon(w)} <code>{esc(label)}</code> · {_warp_detail(w, t)}")
         else:
-            icon, detail = "🟢", place(country)
-        lines.append(f"{icon} {name} · {detail}")
+            icons = [_warp_icon(w) for w in warps]
+            lines.append(f"{_worst_icon(icons)} <code>{esc(name)}</code>")
+            for k, w in enumerate(warps):
+                branch = "└" if k == len(warps) - 1 else "├"
+                lines.append(f"{branch} {icons[k]} {esc(w['name'])} · {_warp_detail(w, t)}")
     tg_send("🛰 <b>Nodes</b>\n\n" + "\n".join(lines))
 
 
@@ -656,76 +893,125 @@ def cmd_status(name):
     conn = db_connect()
     try:
         r = conn.execute("SELECT * FROM nodes WHERE name = ?", (name,)).fetchone()
+        warps = node_warps(r, conn) if r else []
     finally:
         conn.close()
     if not r:
         tg_send(f"❓ Unknown node <code>{esc(name)}</code>")
         return
     t = now()
-    state = node_state(r, t)
-    country = (r["google_country"] or "").upper()
-    last_warp = "up" if r["warp_alive"] else "down"
-    restart = f"{fmt_dur(t - r['last_restart'])} ago" if r["last_restart"] else "never"
+    state = node_state(r, t, warps)
+    multi = len(warps) > 1
+    last_restart = max(w["last_restart"] or 0 for w in warps)
+    restart = f"{fmt_dur(t - last_restart)} ago" if last_restart else "never"
     heartbeat = (
         f"{fmt_dur(t - r['last_heartbeat'])} ago" if r["last_heartbeat"] else "never"
     )
+    title = name if multi else warp_label(name, warps[0]["name"], False)
+
     if state in ("never", "stale"):
         # No fresh report: do not present the last one as the current state.
         icon, what = "⚫", "never connected" if state == "never" else "STALE"
-        google = f"unknown (last report: {place(country)})"
-        warp = f"unknown (last report: {last_warp})"
-    else:
-        if state == "warp_down":
-            icon, what = "🔴", "WARP down"
+        if multi:
+            rows = [
+                (
+                    w["name"],
+                    f"unknown (last report: {place(w['google_country'], full=True)}, "
+                    f"{'up' if w['warp_alive'] else 'down'})",
+                )
+                for w in warps
+            ]
         else:
-            icon, what = ("🟡" if country == "RU" else "🟢"), "status"
-        google, warp = place(country), last_warp
-    tg_send(
-        card(
-            icon,
-            name,
-            what,
-            ("Google", google),
-            ("WARP", warp),
-            ("Heartbeat", heartbeat),
-            ("Last restart", restart),
-        )
-    )
+            w = warps[0]
+            rows = [
+                ("Google", f"unknown (last report: {place(w['google_country'], full=True)})"),
+                ("WARP", f"unknown (last report: {'up' if w['warp_alive'] else 'down'})"),
+            ]
+    else:
+        icons = [_warp_icon(w) for w in warps]
+        icon = _worst_icon(icons)
+        what = "WARP down" if state == "warp_down" else "status"
+        if multi:
+            rows = [
+                (w["name"], f"{icons[k]} {_warp_detail(w, t, full=True)}")
+                for k, w in enumerate(warps)
+            ]
+        else:
+            w = warps[0]
+            rows = [
+                ("Google", place(w["google_country"], full=True)),
+                ("WARP", "up" if w["warp_alive"] else "down"),
+            ]
+    tg_send(card(icon, title, what, *rows, ("Heartbeat", heartbeat), ("Last restart", restart)))
 
 
-def cmd_restart(name):
+def _pick_warps(warps, wanted):
+    """The WARPs a restart is for: the one called `wanted` (any case), or all.
+    Returns (chosen, found); `chosen` holds (target, name) pairs, where target
+    is what is stored on the command ('' for the implicit WARP of a node whose
+    agent reports no list)."""
+    implicit = len(warps) == 1 and warps[0].get("implicit")
+    chosen = warps
+    if wanted:
+        chosen = [w for w in warps if w["name"].lower() == wanted.lower()]
+        if not chosen:
+            return [], False
+    return [("" if implicit else w["name"], w["name"]) for w in chosen], True
+
+
+def cmd_restart(name, wanted=None):
     expire_commands()  # an old command must not block a new one
     conn = db_connect()
     try:
-        r = conn.execute("SELECT name FROM nodes WHERE name = ?", (name,)).fetchone()
-        if not r:
+        node = conn.execute("SELECT * FROM nodes WHERE name = ?", (name,)).fetchone()
+        if not node:
             tg_send(f"❓ Unknown node <code>{esc(name)}</code>")
             return
-        pending = conn.execute(
-            "SELECT id FROM commands WHERE node = ? AND command = 'restart' "
-            "AND result_at IS NULL LIMIT 1",
-            (name,),
-        ).fetchone()
-        if pending:
-            tg_send(card("⏳", name, "restart already pending"))
+        warps = node_warps(node, conn)
+        chosen, found = _pick_warps(warps, wanted)
+        if not found:
+            known = ", ".join(w["name"] for w in warps)
+            tg_send(
+                f"❓ Unknown WARP <code>{esc(wanted)}</code> on <code>{esc(name)}</code>\n"
+                f"Known: <code>{esc(known)}</code>"
+            )
             return
-        cur = conn.execute(
-            "INSERT INTO commands (node, command, created_at) VALUES (?, 'restart', ?)",
-            (name, now()),
-        )
-        cid = cur.lastrowid
-        node = conn.execute("SELECT * FROM nodes WHERE name = ?", (name,)).fetchone()
+        t = now()
+        queued, pending = [], []
+        for target, wname in chosen:
+            if _pending_restart(conn, name, target):
+                pending.append(wname)
+                continue
+            cur = conn.execute(
+                "INSERT INTO commands (node, command, created_at, target) "
+                "VALUES (?, 'restart', ?, ?)",
+                (name, t, target),
+            )
+            queued.append((wname, cur.lastrowid))
+        state = node_state(node, t, warps)
     finally:
         conn.close()
-    log("INFO", f"queued restart #{cid} for {name}")
-    state = node_state(node, now())
+
+    multi = len(warps) > 1
+    for wname, cid in queued:
+        log("INFO", f"queued restart #{cid} for {warp_label(name, wname, multi)}")
     warning = None
     if state in ("never", "stale"):
         warning = (
             "⚠️ Warning",
             f"node is not reporting; expires in {fmt_dur(COMMAND_TTL)} if not picked up",
         )
-    tg_send(card("⏳", name, f"restart #{cid} queued", warning))
+
+    if len(chosen) == 1:
+        label = warp_label(name, chosen[0][1], multi)
+        if pending:
+            tg_send(card("⏳", label, "restart already pending"))
+        else:
+            tg_send(card("⏳", label, f"restart #{queued[0][1]} queued", warning))
+        return
+    rows = [(wname, f"#{cid} queued") for wname, cid in queued]
+    rows += [(wname, "already pending") for wname in pending]
+    tg_send(card("⏳", name, "restart queued" if queued else "nothing queued", *rows, warning))
 
 
 def cmd_restart_all():
@@ -737,29 +1023,32 @@ def cmd_restart_all():
             tg_send("No nodes registered.")
             return
         t = now()
-        queued, skipped = 0, []
+        commands, nodes_hit, skipped = 0, set(), []
         for r in rows:
-            state = node_state(r, t)
-            if state in ("never", "stale"):
+            warps = node_warps(r, conn)
+            if node_state(r, t, warps) in ("never", "stale"):
                 skipped.append((r["name"], "not reporting"))
                 continue
-            pending = conn.execute(
-                "SELECT id FROM commands WHERE node = ? AND command = 'restart' "
-                "AND result_at IS NULL LIMIT 1",
-                (r["name"],),
-            ).fetchone()
-            if pending:
-                skipped.append((r["name"], "already pending"))
-                continue
-            conn.execute(
-                "INSERT INTO commands (node, command, created_at) VALUES (?, 'restart', ?)",
-                (r["name"], t),
-            )
-            queued += 1
+            multi = len(warps) > 1
+            chosen, _ = _pick_warps(warps, None)
+            for target, wname in chosen:
+                if _pending_restart(conn, r["name"], target):
+                    skipped.append((warp_label(r["name"], wname, multi), "already pending"))
+                    continue
+                conn.execute(
+                    "INSERT INTO commands (node, command, created_at, target) "
+                    "VALUES (?, 'restart', ?, ?)",
+                    (r["name"], t, target),
+                )
+                commands += 1
+                nodes_hit.add(r["name"])
     finally:
         conn.close()
-    log("INFO", f"queued restart for {queued} nodes, skipped {len(skipped)}")
-    text = f"🔄 <b>Restart queued</b> · {queued} node{'' if queued == 1 else 's'}"
+    log("INFO", f"queued {commands} restart(s) on {len(nodes_hit)} node(s), skipped {len(skipped)}")
+    n = len(nodes_hit)
+    text = f"🔄 <b>Restart queued</b> · {n} node{'' if n == 1 else 's'}"
+    if commands != n:
+        text += f", {commands} WARPs"
     if skipped:
         text += "\n⏭ Skipped:\n" + "\n".join(
             tree(*[(f"<code>{esc(n)}</code>", why) for n, why in skipped])
@@ -826,11 +1115,11 @@ def handle_command(text):
         cmd_status(args[0]) if args else cmd_nodes()
     elif cmd == "/restart":
         if not args:
-            tg_send("Usage: /restart &lt;node&gt; | /restart all")
+            tg_send("Usage: /restart &lt;node&gt; [warp] | /restart all")
         elif args[0] == "all":
             cmd_restart_all()
         else:
-            cmd_restart(args[0])
+            cmd_restart(args[0], args[1] if len(args) > 1 else None)
     elif cmd == "/logs":
         if args:
             cmd_logs(args[0])
@@ -945,7 +1234,7 @@ _node_seen = {}
 _monitor_started = None
 
 
-def _node_alert_text(name, row, state, told, t):
+def _node_alert_text(name, row, state, t):
     if state == "stale":
         return card(
             "⚫",
@@ -954,26 +1243,30 @@ def _node_alert_text(name, row, state, told, t):
             ("Last heartbeat", f"{fmt_dur(t - row['last_heartbeat'])} ago"),
             ("Likely", "the node, its agent or its network is down"),
         )
-    if state == "warp_down":
-        note = ("Note", "the node is reporting again") if told == "stale" else None
-        return card("🔴", name, "WARP is down", ("Status", "node is up, proxy is not"), note)
-    if told == "stale":
-        return card("🟢", name, "reporting again")
-    return card("🟢", name, "WARP is back")
+    return card("🟢", name, "reporting again")
+
+
+def _warp_alert_text(label, state):
+    if state == "down":
+        return card("🔴", label, "WARP is down", ("Status", "node is up, proxy is not"))
+    return card("🟢", label, "WARP is back")
 
 
 def node_monitor_tick(t=None):
     """One pass over all nodes. Sends one message per state change the
     operator has not been told about yet and returns how many were sent.
 
-    * The state the operator was last told about is persisted (meta
-      node_alert:<name>), so a repeat is never sent, including after a
-      coordinator restart.
+    A node is watched on two levels: silent or reporting (key
+    node_alert:<node>), and, while it reports, each of its WARPs up or down
+    (key warp_alert:<node>:<warp>).
+
+    * What the operator was last told is persisted in meta, so a repeat is
+      never sent, including after a coordinator restart.
     * It is only updated after Telegram accepted the message, so an alert
       that could not be delivered is retried on the next pass.
     * Silence is not judged until STALE_AFTER seconds after start: nodes need
       that long to heartbeat again after a coordinator restart.
-    * WARP-down must persist for WARP_DOWN_ALERT_AFTER seconds, so the short
+    * A WARP must stay down for WARP_DOWN_ALERT_AFTER seconds, so the short
       outage of an ordinary restart does not page anyone.
     """
     global _monitor_started
@@ -984,37 +1277,68 @@ def node_monitor_tick(t=None):
     conn = db_connect()
     try:
         rows = conn.execute("SELECT * FROM nodes").fetchall()
+        data = [(r, node_warps(r, conn)) for r in rows]
     finally:
         conn.close()
 
     sent = 0
-    for r in rows:
-        name = r["name"]
-        state = node_state(r, t)
-        if state == "never":
-            continue
-        if state == "stale" and t - _monitor_started < STALE_AFTER:
-            continue
-        seen = _node_seen.get(name)
+
+    def step(key, seen_key, state, delay, text):
+        """Alert on a change of `state` (the first value is the quiet one)."""
+        nonlocal sent
+        seen = _node_seen.get(seen_key)
         if seen is None or seen[0] != state:
-            seen = _node_seen[name] = (state, t)
-        delay = WARP_DOWN_ALERT_AFTER if state == "warp_down" else 0
+            seen = _node_seen[seen_key] = (state, t)
         if t - seen[1] < delay:
-            continue
-        key = f"node_alert:{name}"
+            return
         told = meta_get(key, "ok")
         if told == state:
-            continue
-        if tg_send(_node_alert_text(name, r, state, told, t)):
+            return
+        if tg_send(text):
             meta_set(key, state)
             sent += 1
-            log("WARN", f"alert sent: {name} {told} -> {state}")
+            log("WARN", f"alert sent: {key} {told} -> {state}")
         else:
-            log("WARN", f"alert for {name} ({state}) not delivered; will retry")
+            log("WARN", f"alert for {key} ({state}) not delivered; will retry")
 
-    known = {r["name"] for r in rows}
-    for name in [n for n in _node_seen if n not in known]:
-        del _node_seen[name]
+    for r, warps in data:
+        name = r["name"]
+        state = node_state(r, t, warps)
+        if state == "never":
+            continue
+        node_level = "stale" if state == "stale" else "ok"
+        if node_level == "stale" and t - _monitor_started < STALE_AFTER:
+            continue
+
+        # Older versions kept "warp_down" under the node key.
+        if meta_get(f"node_alert:{name}", "ok") == "warp_down":
+            meta_set(f"warp_alert:{name}:{warps[0]['name']}", "down")
+            meta_set(f"node_alert:{name}", "ok")
+
+        step(
+            f"node_alert:{name}",
+            (name, None),
+            node_level,
+            0,
+            _node_alert_text(name, r, node_level, t),
+        )
+        if node_level == "stale":
+            continue  # a silent node says nothing about its WARPs
+        for w in warps:
+            wstate = "ok" if w["warp_alive"] else "down"
+            label = warp_label(name, w["name"], len(warps) > 1)
+            step(
+                f"warp_alert:{name}:{w['name']}",
+                (name, w["name"]),
+                wstate,
+                WARP_DOWN_ALERT_AFTER if wstate == "down" else 0,
+                _warp_alert_text(label, wstate),
+            )
+
+    known = {(r["name"], None) for r, _ in data}
+    known |= {(r["name"], w["name"]) for r, ws in data for w in ws}
+    for key in [k for k in _node_seen if k not in known]:
+        del _node_seen[key]
     return sent
 
 
@@ -1277,13 +1601,13 @@ class Handler(BaseHTTPRequestHandler):
         conn = db_connect()
         try:
             node_rows = conn.execute("SELECT * FROM nodes").fetchall()
+            t = now()
+            states = [node_state(r, t, node_warps(r, conn)) for r in node_rows]
             pending = conn.execute(
                 "SELECT COUNT(*) AS c FROM commands WHERE result_at IS NULL"
             ).fetchone()["c"]
         finally:
             conn.close()
-        t = now()
-        states = [node_state(r, t) for r in node_rows]
         nodes = len(node_rows)
         self.reply(
             200,
@@ -1319,6 +1643,9 @@ class Handler(BaseHTTPRequestHandler):
                     name,
                 ),
             )
+            warps = clean_warps(b.get("warps"))
+            if warps:
+                sync_warps(conn, name, warps, now())
         finally:
             conn.close()
         self.reply(200, {"ok": True})
@@ -1333,7 +1660,7 @@ class Handler(BaseHTTPRequestHandler):
         conn = db_connect()
         try:
             rows = conn.execute(
-                "SELECT id, command FROM commands "
+                "SELECT id, command, target FROM commands "
                 "WHERE node = ? AND result_at IS NULL "
                 "  AND not_before <= ? "
                 "  AND MAX(created_at, not_before) >= ? "
@@ -1354,7 +1681,12 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
         self.reply(
-            200, {"commands": [{"id": r["id"], "cmd": r["command"]} for r in rows]}
+            200,
+            {
+                "commands": [
+                    {"id": r["id"], "cmd": r["command"], "warp": r["target"]} for r in rows
+                ]
+            },
         )
 
     def r_result(self):
@@ -1386,6 +1718,14 @@ class Handler(BaseHTTPRequestHandler):
                 (1 if ok else 0, out, now(), cid, name, LEASE_EXPIRED_OUTPUT),
             )
             recorded = cur.rowcount == 1
+            target = ""
+            if recorded:
+                row = conn.execute(
+                    "SELECT target FROM commands WHERE id = ?", (cid,)
+                ).fetchone()
+                target = row["target"] if row else ""
+                warp_name = target or meta["warp"]
+                label = warp_label(name, warp_name, _warp_count(conn, name) > 1)
         finally:
             conn.close()
 
@@ -1396,26 +1736,26 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(200, {"ok": True, "ignored": True})
             return
 
-        _apply_meta_to_node(name, meta)
+        _apply_meta_to_node(name, meta, warp_name)
 
         country = (meta.get("country") or "").strip()
         if meta.get("skipped"):
             log(
                 "INFO",
-                f"result cmd#{cid} from {name}: skipped "
+                f"result cmd#{cid} from {label}: skipped "
                 f"({meta['skipped']}, {meta['cooldown_remaining']}s left)",
             )
         else:
             log(
                 "INFO",
-                f"result cmd#{cid} from {name}: ok={ok} "
+                f"result cmd#{cid} from {label}: ok={ok} "
                 f"warp_up={meta.get('warp_up')} country={country or '?'}",
             )
 
-        tg_send(_format_restart_message(name, meta, f"restart #{cid}", ok=ok, output=out))
+        tg_send(_format_restart_message(label, meta, f"restart #{cid}", ok=ok, output=out))
 
         if ok and meta.get("warp_up") and (not country or country == "?"):
-            _schedule_unknown_retry(name)
+            _schedule_unknown_retry(name, target)
 
         self.reply(200, {"ok": True})
 
@@ -1430,13 +1770,22 @@ class Handler(BaseHTTPRequestHandler):
         raw_meta = b.get("meta")
         meta = clean_meta(raw_meta)
         reason = str(b.get("reason", ""))
+        wanted = b.get("warp")
+        warp_name = (
+            wanted if isinstance(wanted, str) and NODE_NAME_RE.match(wanted) else meta["warp"]
+        )
+        conn = db_connect()
+        try:
+            label = warp_label(name, warp_name, _warp_count(conn, name) > 1)
+        finally:
+            conn.close()
 
-        _apply_meta_to_node(name, meta)
+        _apply_meta_to_node(name, meta, warp_name)
 
         if reason == "auto" and isinstance(raw_meta, dict) and raw_meta:
-            tg_send(_format_restart_message(name, meta, "auto-restart"))
+            tg_send(_format_restart_message(label, meta, "auto-restart"))
         elif text:
-            tg_send(f"💬 <b>{esc(name)}</b>\n{esc(text)}")
+            tg_send(f"💬 <b>{esc(label)}</b>\n{esc(text)}")
 
         self.reply(200, {"ok": True})
 
@@ -1476,8 +1825,16 @@ def cli_remove_node(name):
     try:
         conn.execute("DELETE FROM nodes WHERE name = ?", (name,))
         conn.execute("DELETE FROM commands WHERE node = ?", (name,))
+        conn.execute("DELETE FROM warps WHERE node = ?", (name,))
         for prefix in ("retry_unknown", "node_alert"):
             conn.execute("DELETE FROM meta WHERE key = ?", (f"{prefix}:{name}",))
+        # Per-WARP keys ("<prefix>:<node>:<warp>"). Compared as text, not with
+        # LIKE: '_' in a node name would be a wildcard there.
+        for prefix in ("retry_unknown", "warp_alert"):
+            head = f"{prefix}:{name}:"
+            conn.execute(
+                "DELETE FROM meta WHERE substr(key, 1, ?) = ?", (len(head), head)
+            )
     finally:
         conn.close()
     print(f"Removed {name}")
@@ -1486,41 +1843,43 @@ def cli_remove_node(name):
 def cli_list_nodes():
     conn = db_connect()
     try:
-        rows = conn.execute(
-            "SELECT name, last_heartbeat, google_country, warp_alive "
-            "FROM nodes ORDER BY name"
-        ).fetchall()
+        rows = conn.execute("SELECT * FROM nodes ORDER BY name").fetchall()
+        data = [(r, node_warps(r, conn)) for r in rows]
     finally:
         conn.close()
-    if not rows:
+    if not data:
         print("(no nodes)")
         return
     t = now()
-    for r in rows:
-        state = node_state(r, t)
-        country = r["google_country"] or "?"
-        alive = "yes" if r["warp_alive"] else "no"
+
+    def fields(w):
+        return (w["google_country"] or "?", "yes" if w["warp_alive"] else "no")
+
+    for r, warps in data:
+        state = node_state(r, t, warps)
+        label = {"never": "NEVER", "stale": "STALE", "warp_down": "WARP-DOWN"}.get(state, "OK")
+        multi = len(warps) > 1
         if state == "never":
             detail = "hb=never"
-        elif state == "stale":
-            detail = (
-                f"hb={fmt_dur(t - r['last_heartbeat'])} ago "
-                f"(last report: country={country} alive={alive})"
-            )
         else:
-            detail = (
-                f"hb={fmt_dur(t - r['last_heartbeat'])} "
-                f"country={country} alive={alive}"
-            )
-        label = {"never": "NEVER", "stale": "STALE", "warp_down": "WARP-DOWN"}.get(
-            state, "OK"
-        )
+            age = fmt_dur(t - r["last_heartbeat"])
+            if state == "stale":
+                last = ""
+                if not multi:
+                    country, alive = fields(warps[0])
+                    last = f" (last report: country={country} alive={alive})"
+                detail = f"hb={age} ago{last}"
+            elif multi:
+                detail = f"hb={age}"
+            else:
+                country, alive = fields(warps[0])
+                detail = f"hb={age} country={country} alive={alive}"
         print(f"{r['name']:30s} {label:9s} {detail}")
-
-
-# ===========================================================================
-# Server / main
-# ===========================================================================
+        if multi:
+            for w in warps:
+                country, alive = fields(w)
+                prefix = "last report: " if state in ("never", "stale") else ""
+                print(f"  {w['name']:<28s} {prefix}country={country} alive={alive}")
 
 
 def sanity_check():
